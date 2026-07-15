@@ -84,7 +84,7 @@
           ]
         }
       ],
-      "artifactName": "Grok-Desktop-Setup-${version}.${ext}"
+      "artifactName": "Grok-Desktop-Windows-x64-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,

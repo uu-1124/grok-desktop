@@ -21,7 +21,7 @@ npm run package
 检查安装包签名与 SHA-256：
 
 ```powershell
-$installer = 'release\Grok-Desktop-Setup-0.1.0.exe'
+$installer = 'release\Grok-Desktop-Windows-x64-Setup-0.1.0.exe'
 Get-AuthenticodeSignature -LiteralPath $installer
 Get-FileHash -LiteralPath $installer -Algorithm SHA256
 ```
@@ -33,8 +33,8 @@ Get-FileHash -LiteralPath $installer -Algorithm SHA256
 安装包超过 GitHub 普通 Git 单文件限制，因此不得提交到 Git 历史。源码推送完成后，
 创建带注释的版本标签，并把以下文件作为 GitHub Release 附件上传：
 
-- `Grok-Desktop-Setup-<version>.exe`
-- `Grok-Desktop-Setup-<version>.exe.sha256`
+- `Grok-Desktop-Windows-x64-Setup-<version>.exe`
+- `Grok-Desktop-Windows-x64-Setup-<version>.exe.sha256`
 
 Release Notes 应说明：
 
