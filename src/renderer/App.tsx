@@ -15,6 +15,7 @@ import type {
   McpTransport,
   ModelInfo,
   PermissionOptionKind,
+  PermissionModePreference,
   PermissionRequestPayload,
   RuntimePhase,
   RuntimeSnapshot,
@@ -178,7 +179,7 @@ let mcpEditorSequence = 0;
 interface ConnectionSettingsDraft {
   baseUrl: string;
   apiKey: string;
-  alwaysApprove: boolean;
+  permissionMode: PermissionModePreference;
   modelId: string | null;
   reasoningEffort: string | null;
   mcpServers: McpServerConfig[];
@@ -556,11 +557,38 @@ export function shouldAutoConnectWorkspace(baseUrl: string): boolean {
   return !baseUrl.trim() || isLoopbackXaiApiBaseUrl(baseUrl);
 }
 
-export function resolveRequestedAlwaysApprove(
-  committed: boolean,
-  settings?: Pick<ConnectionSettingsDraft, "alwaysApprove">,
-): boolean {
-  return settings?.alwaysApprove ?? committed;
+export function resolveRequestedPermissionMode(
+  committed: PermissionModePreference,
+  settings?: Pick<ConnectionSettingsDraft, "permissionMode">,
+  override?: PermissionModePreference,
+): PermissionModePreference {
+  return override ?? settings?.permissionMode ?? committed;
+}
+
+const PERMISSION_MODE_OPTIONS: ReadonlyArray<{
+  id: PermissionModePreference;
+  label: string;
+  description: string;
+  recommended?: boolean;
+  danger?: boolean;
+}> = [
+  { id: "default", label: "逐项授权", description: "敏感工具每次执行前都由你确认。" },
+  {
+    id: "auto",
+    label: "自动",
+    description: "Grok 自动批准安全操作，危险操作仍会询问。",
+    recommended: true,
+  },
+  {
+    id: "always_approve",
+    label: "完全授权",
+    description: "跳过所有工具确认，仅用于完全信任的工作区。",
+    danger: true,
+  },
+];
+
+export function permissionModeLabel(mode: PermissionModePreference): string {
+  return PERMISSION_MODE_OPTIONS.find((option) => option.id === mode)?.label ?? "逐项授权";
 }
 
 export function moveCommandSelection(
@@ -987,7 +1015,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTargetWorkspacePath, setSettingsTargetWorkspacePath] = useState<string | null | undefined>(undefined);
   const [workspaceConnectionBusy, setWorkspaceConnectionBusy] = useState(false);
-  const [alwaysApprove, setAlwaysApprove] = useState(false);
+  const [permissionMode, setPermissionMode] = useState<PermissionModePreference>("default");
   const [xaiApiBaseUrl, setXaiApiBaseUrl] = useState("");
   const [xaiApiKey, setXaiApiKey] = useState("");
   const [workspaceMcpConfigs, setWorkspaceMcpConfigs] = useState<WorkspaceMcpConfigs>({});
@@ -1072,6 +1100,7 @@ function App() {
         )
       : snapshot.message;
     setRuntime(message === snapshot.message ? snapshot : { ...snapshot, message });
+    if (snapshot.permissionMode) setPermissionMode(snapshot.permissionMode);
     setSelectedWorkspacePath((current) =>
       resolveWorkspaceContext(snapshot.workspacePath, current, null),
     );
@@ -1281,6 +1310,9 @@ function App() {
           ? payload.settings.xaiApiBaseUrl ?? ""
           : sync.runtime.xaiApiBaseUrl ?? "";
         setXaiApiBaseUrl(configuredBaseUrl);
+        const configuredPermissionMode = sync.runtime.permissionMode
+          ?? payload.settings.permissionMode;
+        setPermissionMode(configuredPermissionMode);
         const configuredBaseUrlError = validateXaiApiBaseUrl(configuredBaseUrl);
         if (configuredBaseUrlError) {
           pushNotice(`已保存的 API Base URL 无效：${configuredBaseUrlError}`, "warning");
@@ -1305,6 +1337,7 @@ function App() {
             const result = await window.grokDesktop.connect({
               workspacePath: lastWorkspace,
               ...(payload.installation.executablePath ? { executablePath: payload.installation.executablePath } : {}),
+              permissionMode: configuredPermissionMode,
               xaiApiBaseUrl: normalizeXaiApiBaseUrl(configuredBaseUrl),
               ...(xaiApiKeyRef.current ? { xaiApiKey: xaiApiKeyRef.current } : {}),
               ...(requestedMcpServers.length > 0 ? { mcpServers: requestedMcpServers } : {}),
@@ -1323,6 +1356,9 @@ function App() {
               setBaseUrlPersistenceFailed(!result.xaiApiBaseUrlPersisted);
               if (!result.xaiApiBaseUrlPersisted) {
                 pushNotice("已连接，但 API Base URL 无法写入磁盘；重启后需要重新设置。", "warning");
+              }
+              if (!result.permissionModePersisted) {
+                pushNotice("已连接，但权限模式无法写入磁盘；重启后将恢复逐项授权。", "warning");
               }
             }
           } catch (error) {
@@ -1444,11 +1480,16 @@ function App() {
   const connectWorkspace = useCallback(async (
     path: string,
     settings?: ConnectionSettingsDraft,
+    permissionModeOverride?: PermissionModePreference,
   ): Promise<RuntimeSnapshot | null> => {
     if (!path || workspaceConnectionBusyRef.current) return null;
     const requestedBaseUrl = settings ? settings.baseUrl : xaiApiBaseUrl;
     const requestedApiKey = normalizeXaiApiKey(settings ? settings.apiKey : xaiApiKey);
-    const requestedAlwaysApprove = resolveRequestedAlwaysApprove(alwaysApprove, settings);
+    const requestedPermissionMode = resolveRequestedPermissionMode(
+      permissionMode,
+      settings,
+      permissionModeOverride,
+    );
     const requestedMcpServers = settings
       ? settings.mcpServers
       : readWorkspaceMcpServers(workspaceMcpConfigs, path, platform);
@@ -1491,7 +1532,7 @@ function App() {
         ...(installation?.executablePath ? { executablePath: installation.executablePath } : {}),
         ...(settings?.modelId ? { modelId: settings.modelId } : {}),
         ...(settings?.reasoningEffort ? { reasoningEffort: settings.reasoningEffort } : {}),
-        alwaysApprove: requestedAlwaysApprove,
+        permissionMode: requestedPermissionMode,
         xaiApiBaseUrl: normalizeXaiApiBaseUrl(requestedBaseUrl),
         ...(requestedApiKey ? { xaiApiKey: requestedApiKey } : {}),
         ...(normalizedMcpServers.length > 0 ? { mcpServers: normalizedMcpServers } : {}),
@@ -1513,6 +1554,9 @@ function App() {
       if (!result.xaiApiBaseUrlPersisted) {
         pushNotice("已连接，但 API Base URL 无法写入磁盘；重启后需要重新设置。", "warning");
       }
+      if (!result.permissionModePersisted) {
+        pushNotice("已连接，但权限模式无法写入磁盘；重启后将恢复逐项授权。", "warning");
+      }
       setContextFileDrafts({});
       setRailOpen(false);
       return snapshot;
@@ -1528,7 +1572,7 @@ function App() {
   }, [
     acceptRuntimeSnapshot,
     acquireWorkspaceConnection,
-    alwaysApprove,
+    permissionMode,
     installation?.executablePath,
     mainView,
     openSettings,
@@ -1539,6 +1583,25 @@ function App() {
     xaiApiBaseUrl,
     xaiApiKey,
   ]);
+
+  const changePermissionMode = useCallback(async (nextMode: PermissionModePreference) => {
+    if (anyTaskBusy || workspaceConnectionBusyRef.current) return;
+    if (nextMode === permissionMode && runtime.permissionMode === nextMode) return;
+    if (!workspacePath) {
+      try {
+        const saved = await window.grokDesktop.setPermissionMode(nextMode);
+        setPermissionMode(saved);
+        pushNotice(`权限模式已设为${permissionModeLabel(saved)}，将在下次连接时生效`);
+      } catch (error) {
+        pushNotice(userFacingErrorMessage(error, "权限模式保存失败"), "error");
+      }
+      return;
+    }
+    const snapshot = await connectWorkspace(workspacePath, undefined, nextMode);
+    if (!snapshot) return;
+    setPermissionMode(nextMode);
+    pushNotice(`已切换为${permissionModeLabel(nextMode)}`);
+  }, [anyTaskBusy, connectWorkspace, permissionMode, pushNotice, runtime.permissionMode, workspacePath]);
 
   const toggleTerminal = useCallback(async () => {
     if (!workspacePath || anyTaskBusy || terminalSwitchBusy || workspaceConnectionBusyRef.current) return;
@@ -1578,7 +1641,7 @@ function App() {
       const normalizedSettings = {
         baseUrl: normalizedBaseUrl ?? "",
         apiKey: normalizeXaiApiKey(settings.apiKey),
-        alwaysApprove: settings.alwaysApprove,
+        permissionMode: settings.permissionMode,
         modelId: settings.modelId,
         reasoningEffort: settings.reasoningEffort,
         mcpServers: normalizeMcpServers(settings.mcpServers),
@@ -1589,11 +1652,14 @@ function App() {
           throw new Error("请先选择工作区，再配置 MCP 服务器。");
         }
         const savedBaseUrl = await window.grokDesktop.setXaiApiBaseUrl(normalizedBaseUrl);
+        const savedPermissionMode = await window.grokDesktop.setPermissionMode(
+          normalizedSettings.permissionMode,
+        );
         setBaseUrlPersistenceFailed(false);
         setXaiApiBaseUrl(savedBaseUrl ?? "");
         setXaiApiKey(normalizedSettings.apiKey);
         xaiApiKeyRef.current = normalizedSettings.apiKey;
-        setAlwaysApprove(normalizedSettings.alwaysApprove);
+        setPermissionMode(savedPermissionMode);
         pushNotice("连接设置已保存，将在下次打开项目时应用");
         return true;
       }
@@ -1602,7 +1668,7 @@ function App() {
       setXaiApiBaseUrl(normalizedSettings.baseUrl);
       setXaiApiKey(normalizedSettings.apiKey);
       xaiApiKeyRef.current = normalizedSettings.apiKey;
-      setAlwaysApprove(normalizedSettings.alwaysApprove);
+      setPermissionMode(normalizedSettings.permissionMode);
       return true;
     } catch (error) {
       pushNotice(
@@ -2022,6 +2088,7 @@ function App() {
               onCreateSession={beginNewTask}
               onDismissReplayWarning={() => setReplayHistoryIncomplete(false)}
               onOpenConnectionSettings={() => openSettings(workspacePath)}
+              onChangePermissionMode={(mode) => void changePermissionMode(mode)}
               onQuickPrompt={(prompt) => void submitPrompt(prompt)}
               onReconnect={() => {
                 if (workspacePath) void connectWorkspace(workspacePath);
@@ -2036,6 +2103,7 @@ function App() {
               reconnectBlocked={anyTaskBusy}
               replayHistoryIncomplete={replayHistoryIncomplete}
               runtime={runtime}
+              permissionMode={permissionMode}
               showScrollToLatest={timelineFollowPaused}
               timelineRef={timelineRef}
             />
@@ -2056,7 +2124,7 @@ function App() {
 
       {settingsOpen && (
         <SettingsModal
-          alwaysApprove={alwaysApprove}
+          permissionMode={permissionMode}
           bootstrap={bootstrap!}
           key={workspaceMcpConfigKey(settingsWorkspacePath, platform) ?? "global-settings"}
           installation={installation}
@@ -2100,9 +2168,10 @@ function RuntimePill({ runtime, terminalMode }: { runtime: RuntimeSnapshot; term
   if (terminalMode) {
     return <div aria-label="原始终端" className="runtime-pill" data-permission="none" data-phase="ready" role="status" title="Grok 原始 CLI 兼容模式"><i /><span>原始终端</span></div>;
   }
-  const alwaysApprove = runtime.permissionMode === "always_approve";
   const status = STATUS_COPY[runtime.phase];
-  const label = alwaysApprove ? `${status} · 始终批准` : status;
+  const label = runtime.permissionMode
+    ? `${status} · ${permissionModeLabel(runtime.permissionMode)}`
+    : status;
   return <div aria-label={label} className="runtime-pill" data-permission={runtime.permissionMode ?? "none"} data-phase={runtime.phase} role="status" title={runtime.message ?? label}><i /><span>{label}</span></div>;
 }
 
@@ -2417,6 +2486,7 @@ interface ConversationStageProps {
   currentView?: SessionViewState;
   execution?: SessionExecutionSnapshot;
   runtime: RuntimeSnapshot;
+  permissionMode: PermissionModePreference;
   canUseSession: boolean;
   connectionBusy: boolean;
   isWorking: boolean;
@@ -2428,6 +2498,7 @@ interface ConversationStageProps {
   onCreateSession(): void;
   onAttachContextFiles(): void;
   onChangeMode(modeId: string): void;
+  onChangePermissionMode(mode: PermissionModePreference): void;
   onChangeComposer(value: string): void;
   onSubmit(): void;
   onCancel(): void;
@@ -2585,9 +2656,131 @@ function ConversationStage(props: ConversationStageProps) {
           )}
           {isWorking ? <button aria-busy={isCancelling} aria-label={isCancelling ? "正在停止执行" : "停止执行"} className="composer__action composer__action--stop" disabled={isCancelling} onClick={props.onCancel} title={isCancelling ? "正在等待 Grok 确认停止" : "停止执行"} type="button"><StopIcon size={16}/></button> : <button className="composer__action" aria-label="发送" disabled={!props.composer.trim() || !canUseSession} onClick={props.onSubmit} type="button"><ArrowUpIcon size={17}/></button>}
         </div>
-        <div className="composer-meta"><span>{modelLabel}</span>{connectionBadge && <button className="composer-connection" data-key-configured={connectionBadge.keyConfigured} onClick={props.onOpenConnectionSettings} title={connectionBadge.title} type="button"><i/>{connectionBadge.label}</button>}<span className={runtime.permissionMode === "always_approve" ? "permission-mode-label is-danger" : "permission-mode-label"}>{runtime.permissionMode === "always_approve" ? "始终批准" : "逐项授权"}</span><span>Enter 发送 · Shift+Enter 换行</span>{props.contextFiles.length > 0 && <span>{props.contextFiles.length} 个文件</span>}<UsageDisclosure view={currentView}/></div>
+        <div className="composer-meta"><span>{modelLabel}</span>{connectionBadge && <button className="composer-connection" data-key-configured={connectionBadge.keyConfigured} onClick={props.onOpenConnectionSettings} title={connectionBadge.title} type="button"><i/>{connectionBadge.label}</button>}<PermissionModeControl disabled={props.connectionBusy || props.reconnectBlocked} mode={runtime.permissionMode ?? props.permissionMode} onChange={props.onChangePermissionMode}/><span className="composer-shortcut">Enter 发送 · Shift+Enter 换行</span>{props.contextFiles.length > 0 && <span>{props.contextFiles.length} 个文件</span>}<UsageDisclosure view={currentView}/></div>
       </div>
     </section>
+  );
+}
+
+function PermissionModeControl({
+  disabled,
+  mode,
+  onChange,
+}: {
+  disabled: boolean;
+  mode: PermissionModePreference;
+  onChange(mode: PermissionModePreference): void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirmDanger, setConfirmDanger] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const current = PERMISSION_MODE_OPTIONS.find((option) => option.id === mode)
+    ?? PERMISSION_MODE_OPTIONS[0]!;
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (rootRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+      setConfirmDanger(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [open]);
+
+  useEffect(() => {
+    if (!disabled) return;
+    setOpen(false);
+    setConfirmDanger(false);
+  }, [disabled]);
+
+  const choose = (nextMode: PermissionModePreference) => {
+    if (nextMode === "always_approve" && mode !== "always_approve") {
+      setConfirmDanger(true);
+      return;
+    }
+    setOpen(false);
+    setConfirmDanger(false);
+    if (nextMode !== mode) onChange(nextMode);
+  };
+
+  return (
+    <div
+      className="permission-mode-control"
+      data-mode={mode}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !open) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+        setConfirmDanger(false);
+        triggerRef.current?.focus();
+      }}
+      ref={rootRef}
+    >
+      <button
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={`权限模式：${current.label}`}
+        className={current.danger ? "permission-mode-control__trigger is-danger" : "permission-mode-control__trigger"}
+        disabled={disabled}
+        onClick={() => {
+          setOpen((visible) => !visible);
+          setConfirmDanger(false);
+        }}
+        ref={triggerRef}
+        title={disabled ? "请先停止当前任务，再切换权限模式" : "切换 Grok 工具授权方式"}
+        type="button"
+      >
+        <i />
+        <span>权限：{current.label}</span>
+        <ChevronIcon size={11}/>
+      </button>
+      {open && (
+        <div aria-label="权限模式" className="permission-mode-menu" role="menu">
+          <div className="permission-mode-menu__heading">
+            <strong>权限模式</strong>
+            <span>切换后会重新连接 Grok</span>
+          </div>
+          <div className="permission-mode-menu__options">
+            {PERMISSION_MODE_OPTIONS.map((option) => (
+              <button
+                aria-checked={option.id === mode}
+                className={`${option.danger ? "is-danger " : ""}${option.id === mode ? "is-selected" : ""}`.trim()}
+                data-permission-option={option.id}
+                key={option.id}
+                onClick={() => choose(option.id)}
+                role="menuitemradio"
+                type="button"
+              >
+                <span className="permission-mode-menu__check">
+                  {option.id === mode && <CheckIcon size={13}/>}
+                </span>
+                <span>
+                  <strong>{option.label}{option.recommended && <em>推荐</em>}</strong>
+                  <small>{option.description}</small>
+                </span>
+              </button>
+            ))}
+          </div>
+          {confirmDanger && (
+            <div className="permission-mode-confirm" role="alert">
+              <strong>确认启用完全授权？</strong>
+              <p>Grok 将不再询问工具操作。请只在你信任当前项目及其指令时使用。</p>
+              <div>
+                <button onClick={() => setConfirmDanger(false)} type="button">取消</button>
+                <button className="is-danger" onClick={() => {
+                  setOpen(false);
+                  setConfirmDanger(false);
+                  onChange("always_approve");
+                }} type="button">启用完全授权</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2900,7 +3093,7 @@ interface SettingsModalProps {
   runtime: RuntimeSnapshot;
   taskBusy: boolean;
   terminalMode: boolean;
-  alwaysApprove: boolean;
+  permissionMode: PermissionModePreference;
   xaiApiBaseUrl: string;
   xaiApiKey: string;
   mcpServers: McpServerConfig[];
@@ -2922,7 +3115,7 @@ function SettingsModal({
   runtime,
   taskBusy,
   terminalMode,
-  alwaysApprove,
+  permissionMode,
   xaiApiBaseUrl,
   xaiApiKey,
   mcpServers,
@@ -2936,7 +3129,7 @@ function SettingsModal({
   const dialogRef = useDialogFocus<HTMLElement>("settings");
   const [draftBaseUrl, setDraftBaseUrl] = useState(xaiApiBaseUrl);
   const [draftApiKey, setDraftApiKey] = useState(xaiApiKey);
-  const [draftAlwaysApprove, setDraftAlwaysApprove] = useState(alwaysApprove);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(permissionMode);
   const [draftMcpServers, setDraftMcpServers] = useState<EditableMcpServer[]>(
     () => createEditableMcpServers(mcpServers),
   );
@@ -3236,7 +3429,7 @@ function SettingsModal({
     const applied = await onApplyConnectionSettings(workspacePath, {
         baseUrl: draftBaseUrl,
         apiKey: draftApiKey,
-        alwaysApprove: draftAlwaysApprove,
+        permissionMode: draftPermissionMode,
         modelId: draftModelId || null,
         reasoningEffort: draftReasoningEffort || null,
         mcpServers: normalizeMcpServers(draftMcpServers),
@@ -3561,15 +3754,28 @@ function SettingsModal({
           )}
 
           <section className="settings-group" aria-labelledby="permission-settings-title">
-            <div className="settings-group__heading"><h3 id="permission-settings-title">权限策略</h3><p>保持逐项授权可让敏感操作在执行前等待确认。</p></div>
-            <button className="toggle-row" aria-pressed={draftAlwaysApprove} disabled={connectionBusy} onClick={() => setDraftAlwaysApprove((enabled) => !enabled)} type="button">
-              <span><strong>始终批准模式</strong><small>开启后会在下一次连接时生效；当前连接可通过下方“应用并重新连接”立即更新。</small></span><i className={draftAlwaysApprove ? "is-on" : ""}><b/></i>
-            </button>
+            <div className="settings-group__heading"><h3 id="permission-settings-title">权限策略</h3><p>选择 Grok 原生权限模式。应用后会重新连接，正在运行任务时不能切换。</p></div>
+            <div aria-label="权限策略" className="permission-mode-settings" role="radiogroup">
+              {PERMISSION_MODE_OPTIONS.map((option) => (
+                <button
+                  aria-checked={draftPermissionMode === option.id}
+                  className={`${option.danger ? "is-danger " : ""}${draftPermissionMode === option.id ? "is-selected" : ""}`.trim()}
+                  disabled={connectionBusy || taskBusy}
+                  key={option.id}
+                  onClick={() => setDraftPermissionMode(option.id)}
+                  role="radio"
+                  type="button"
+                >
+                  <span className="permission-mode-settings__check">{draftPermissionMode === option.id && <CheckIcon size={14}/>}</span>
+                  <span><strong>{option.label}{option.recommended && <em>推荐</em>}</strong><small>{option.description}</small></span>
+                </button>
+              ))}
+            </div>
           </section>
 
           <section className="settings-group settings-meta" aria-labelledby="runtime-info-title">
             <div className="settings-group__heading"><h3 id="runtime-info-title">运行信息</h3></div>
-            <dl><div><dt>桌面端</dt><dd>v{bootstrap.appVersion}</dd></div><div><dt>Grok</dt><dd>{runtime.grokVersion || installation?.version || "未知"}</dd></div><div><dt>ACP</dt><dd>{runtime.protocolVersion ?? "未连接"}</dd></div><div><dt>API</dt><dd title={runtime.xaiApiBaseUrl ?? undefined}>{runtime.phase === "offline" ? "未连接" : runtime.xaiApiBaseUrl || "Grok 默认"}</dd></div><div><dt>权限</dt><dd>{runtime.permissionMode === "always_approve" ? "始终批准" : runtime.permissionMode === "default" ? "逐项授权" : "未连接"}</dd></div><div><dt>平台</dt><dd>{bootstrap.platform}</dd></div></dl>
+            <dl><div><dt>桌面端</dt><dd>v{bootstrap.appVersion}</dd></div><div><dt>Grok</dt><dd>{runtime.grokVersion || installation?.version || "未知"}</dd></div><div><dt>ACP</dt><dd>{runtime.protocolVersion ?? "未连接"}</dd></div><div><dt>API</dt><dd title={runtime.xaiApiBaseUrl ?? undefined}>{runtime.phase === "offline" ? "未连接" : runtime.xaiApiBaseUrl || "Grok 默认"}</dd></div><div><dt>权限</dt><dd>{runtime.permissionMode ? permissionModeLabel(runtime.permissionMode) : permissionModeLabel(draftPermissionMode)}</dd></div><div><dt>平台</dt><dd>{bootstrap.platform}</dd></div></dl>
           </section>
         </div>
 

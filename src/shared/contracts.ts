@@ -60,10 +60,13 @@ export interface StoredSession {
   updatedAt: string;
 }
 
+export type PermissionModePreference = "default" | "auto" | "always_approve";
+
 export interface DesktopSettingsSnapshot {
   grokExecutablePath: string | null;
   /** Non-sensitive normalized endpoint; credentials must never be embedded in this URL. */
   xaiApiBaseUrl: string | null;
+  permissionMode: PermissionModePreference;
   lastWorkspacePath: string | null;
   recentWorkspaces: RecentWorkspace[];
   recentSessions: StoredSession[];
@@ -117,6 +120,8 @@ export interface ConnectRequest {
   modelId?: string;
   /** A model-advertised reasoning level used only for this Grok process. */
   reasoningEffort?: string;
+  permissionMode?: PermissionModePreference;
+  /** @deprecated Compatibility for older renderer builds. Prefer permissionMode. */
   alwaysApprove?: boolean;
   /** Undefined reuses the saved URL; null clears it after a successful connection. */
   xaiApiBaseUrl?: string | null;
@@ -196,7 +201,7 @@ export function createEmptyRuntimeCapabilities(): RuntimeCapabilities {
 
 export interface RuntimeSnapshot {
   phase: RuntimePhase;
-  permissionMode: "default" | "always_approve" | null;
+  permissionMode: PermissionModePreference | null;
   /** Normalized non-secret endpoint used by the current or latest connection attempt. */
   xaiApiBaseUrl: string | null;
   /** True only while the active Grok process received an explicit in-memory API key. */
@@ -375,6 +380,7 @@ export interface RuntimeSyncPayload {
 export interface ConnectResult {
   snapshot: RuntimeSnapshot;
   xaiApiBaseUrlPersisted: boolean;
+  permissionModePersisted: boolean;
 }
 
 export interface DesktopApi {
@@ -385,6 +391,7 @@ export interface DesktopApi {
   chooseExecutable(): Promise<GrokInstallation | null>;
   chooseMcpExecutable(): Promise<string | null>;
   setXaiApiBaseUrl(xaiApiBaseUrl: string | null): Promise<string | null>;
+  setPermissionMode(mode: PermissionModePreference): Promise<PermissionModePreference>;
   connect(request: ConnectRequest): Promise<ConnectResult>;
   disconnect(): Promise<void>;
   createSession(title?: string): Promise<SessionReadyPayload>;

@@ -4,7 +4,7 @@
 `grok.exe`，而是在运行时发现现有安装，并通过 Grok 官方 Agent Client Protocol
 （ACP）建立结构化连接。
 
-> 当前版本：`0.1.0` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
+> 当前版本：`0.1.1` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
 > 尚未进行 Windows 代码签名，公开分发时可能触发 SmartScreen 的未知发布者提示。
 
 源码与版本说明托管在 GitHub；Windows 安装包通过
@@ -14,8 +14,9 @@
 
 - ACP 是主交互路径：会话、流式回复、Thought、工具调用、计划和权限请求。
 - ConPTY 是兼容路径：仅用于尚未映射到 ACP 的原始 TUI 功能。
-- 默认连接会显式使用 Grok 的 `default` 权限模式，覆盖 CLI 中可能遗留的
-  `always-approve` 偏好；只有用户在桌面设置中主动开启时才进入始终批准模式。
+- Composer 附近提供逐项授权、自动和完全授权三档权限入口，并映射到 Grok 原生
+  `default`、`auto` 与 `bypassPermissions + --always-approve`。默认仍为逐项授权；
+  用户选择会保存到桌面设置，完全授权始终使用危险状态并要求显式确认。
 - 每次 ACP 连接使用独立的 Grok Agent，不复用共享 Leader，保证用户在桌面端选择的
   API 地址、内存态 Key、模型和权限策略确实作用于当前连接。
 - 设置页允许用户覆盖 xAI API Base URL；远程地址必须使用 HTTPS，本机回环开发服务可
@@ -91,7 +92,7 @@ npm run package
 
 `npm run test:electron` 直接启动 `release/win-unpacked/Grok Desktop.exe`，使用系统临时目录中的
 隔离 `userData` 和本机已安装的 Grok，通过 Electron CDP 验证历史任务失败恢复、错误文案、
-键盘焦点、本地最近记录移除、ACP 认证方式展示、浅色权限弹窗和原始终端入口。权限视觉检查
+键盘焦点、本地最近记录移除、ACP 认证方式展示、Composer 三档权限菜单、浅色权限弹窗和原始终端入口。权限视觉检查
 只会临时注入无行为的 DOM 夹具，并在 1280×720 下使用完整四选项验证取消入口和末尾选项
 仍可访问。测试不会发送 Prompt、不会调用 Grok 登录，也不会使用用户真实的桌面端设置。
 若尚未生成 unpacked 应用，可运行：

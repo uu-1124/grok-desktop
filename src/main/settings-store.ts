@@ -4,6 +4,7 @@ import path from "node:path";
 
 import type {
   DesktopSettingsSnapshot,
+  PermissionModePreference,
   RecentWorkspace,
   StoredSession,
 } from "../shared/contracts.js";
@@ -22,6 +23,7 @@ interface SettingsDocument {
 const EMPTY_SETTINGS: DesktopSettingsSnapshot = {
   grokExecutablePath: null,
   xaiApiBaseUrl: null,
+  permissionMode: "default",
   lastWorkspacePath: null,
   recentWorkspaces: [],
   recentSessions: [],
@@ -70,6 +72,13 @@ export class SettingsStore {
     const value = normalizeXaiApiBaseUrl(xaiApiBaseUrl) ?? null;
     await this.#mutate((settings) => {
       settings.xaiApiBaseUrl = value;
+    });
+  }
+
+  async setPermissionMode(permissionMode: PermissionModePreference): Promise<void> {
+    const value = requirePermissionMode(permissionMode);
+    await this.#mutate((settings) => {
+      settings.permissionMode = value;
     });
   }
 
@@ -186,6 +195,7 @@ function parseSettingsDocument(value: unknown): DesktopSettingsSnapshot {
   return {
     grokExecutablePath: nullablePath(settings.grokExecutablePath),
     xaiApiBaseUrl: normalizeStoredXaiApiBaseUrl(settings.xaiApiBaseUrl),
+    permissionMode: parsePermissionMode(settings.permissionMode),
     lastWorkspacePath: nullablePath(settings.lastWorkspacePath),
     recentWorkspaces: Array.isArray(settings.recentWorkspaces)
       ? settings.recentWorkspaces
@@ -240,6 +250,17 @@ function normalizeStoredXaiApiBaseUrl(value: unknown): string | null {
   return normalizeXaiApiBaseUrl(value) ?? null;
 }
 
+function parsePermissionMode(value: unknown): PermissionModePreference {
+  return value === "auto" || value === "always_approve" ? value : "default";
+}
+
+function requirePermissionMode(value: unknown): PermissionModePreference {
+  if (value !== "default" && value !== "auto" && value !== "always_approve") {
+    throw new Error("Invalid permissionMode.");
+  }
+  return value;
+}
+
 function optionalText(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -275,6 +296,7 @@ function cloneSnapshot(settings: DesktopSettingsSnapshot): DesktopSettingsSnapsh
   return {
     grokExecutablePath: settings.grokExecutablePath,
     xaiApiBaseUrl: settings.xaiApiBaseUrl,
+    permissionMode: settings.permissionMode,
     lastWorkspacePath: settings.lastWorkspacePath,
     recentWorkspaces: settings.recentWorkspaces.map((entry) => ({ ...entry })),
     recentSessions: settings.recentSessions.map((entry) => ({ ...entry })),

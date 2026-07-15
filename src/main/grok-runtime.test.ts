@@ -235,7 +235,7 @@ describe("Grok MCP session configuration", () => {
   it("derives the stdio mask from the actual Grok launch environment without copying values", () => {
     const launch = buildGrokAgentLaunch({
       modelId: null,
-      alwaysApprove: false,
+      permissionMode: "default",
       xaiApiBaseUrl: null,
       xaiApiKey: "ui-only-xai-secret",
     }, { Path: "C:\\Windows" });

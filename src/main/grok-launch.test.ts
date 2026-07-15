@@ -76,7 +76,7 @@ describe("Grok agent launch", () => {
     const launch = buildGrokAgentLaunch(
       {
         modelId: "model-from-acp",
-        alwaysApprove: true,
+        permissionMode: "always_approve",
         xaiApiBaseUrl: "https://gateway.example.com/v1",
         xaiApiKey: "child-test-key",
       },
@@ -113,7 +113,7 @@ describe("Grok agent launch", () => {
   ])("rejects model IDs containing control characters %#", (modelId) => {
     expect(() => buildGrokAgentLaunch({
       modelId,
-      alwaysApprove: false,
+      permissionMode: "default",
       xaiApiBaseUrl: null,
     })).toThrow(/modelId/u);
   });
@@ -121,7 +121,7 @@ describe("Grok agent launch", () => {
   it("binds a leading-dash model ID to the model option", () => {
     const launch = buildGrokAgentLaunch({
       modelId: "--always-approve",
-      alwaysApprove: false,
+      permissionMode: "default",
       xaiApiBaseUrl: null,
     });
 
@@ -133,7 +133,7 @@ describe("Grok agent launch", () => {
     const launch = buildGrokAgentLaunch({
       modelId: "grok-build",
       reasoningEffort: "--always-approve",
-      alwaysApprove: false,
+      permissionMode: "default",
       xaiApiBaseUrl: null,
     });
 
@@ -150,7 +150,7 @@ describe("Grok agent launch", () => {
     expect(() => buildGrokAgentLaunch({
       modelId: "grok-build",
       reasoningEffort,
-      alwaysApprove: false,
+      permissionMode: "default",
       xaiApiBaseUrl: null,
     })).toThrow(/reasoningEffort/u);
   });
@@ -159,7 +159,7 @@ describe("Grok agent launch", () => {
     const launch = buildGrokAgentLaunch(
       {
         modelId: null,
-        alwaysApprove: false,
+        permissionMode: "default",
         xaiApiBaseUrl: null,
       },
       {
@@ -183,6 +183,31 @@ describe("Grok agent launch", () => {
     });
   });
 
+  it("uses Grok's native auto permission mode without enabling unrestricted approval", () => {
+    const launch = buildGrokAgentLaunch({
+      modelId: null,
+      permissionMode: "auto",
+      xaiApiBaseUrl: null,
+    });
+
+    expect(launch.args).toEqual([
+      "--permission-mode",
+      "auto",
+      "agent",
+      "--no-leader",
+      "stdio",
+    ]);
+    expect(launch.args).not.toContain("--always-approve");
+  });
+
+  it("rejects unknown permission modes before building a child process argument vector", () => {
+    expect(() => buildGrokAgentLaunch({
+      modelId: null,
+      permissionMode: "unknown" as "default",
+      xaiApiBaseUrl: null,
+    })).toThrow(/permissionMode/u);
+  });
+
   it.each([
     "https://gateway.example.com/v1",
     "http://localhost:8080/v1",
@@ -198,7 +223,7 @@ describe("Grok agent launch", () => {
       const launch = buildGrokAgentLaunch(
         {
           modelId: null,
-          alwaysApprove: false,
+          permissionMode: "default",
           xaiApiBaseUrl,
         },
         parentEnv,

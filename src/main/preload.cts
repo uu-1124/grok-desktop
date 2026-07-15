@@ -4,6 +4,7 @@ import type {
   ConnectRequest,
   DesktopApi,
   DesktopEventEnvelope,
+  PermissionModePreference,
   PermissionResponsePayload,
   PromptRequest,
   TerminalResizeRequest,
@@ -18,6 +19,7 @@ const CHANNELS = {
   chooseExecutable: "grok-desktop:choose-executable",
   chooseMcpExecutable: "grok-desktop:choose-mcp-executable",
   setXaiApiBaseUrl: "grok-desktop:set-xai-api-base-url",
+  setPermissionMode: "grok-desktop:set-permission-mode",
   connect: "grok-desktop:connect",
   disconnect: "grok-desktop:disconnect",
   createSession: "grok-desktop:create-session",
@@ -47,6 +49,8 @@ const api: DesktopApi = Object.freeze({
   chooseMcpExecutable: () => ipcRenderer.invoke(CHANNELS.chooseMcpExecutable),
   setXaiApiBaseUrl: (xaiApiBaseUrl: string | null) =>
     ipcRenderer.invoke(CHANNELS.setXaiApiBaseUrl, xaiApiBaseUrl),
+  setPermissionMode: (permissionMode: PermissionModePreference) =>
+    ipcRenderer.invoke(CHANNELS.setPermissionMode, permissionMode),
   connect: (request: ConnectRequest) => ipcRenderer.invoke(CHANNELS.connect, request),
   disconnect: () => ipcRenderer.invoke(CHANNELS.disconnect),
   createSession: (title?: string) => ipcRenderer.invoke(CHANNELS.createSession, title),

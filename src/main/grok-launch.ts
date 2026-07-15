@@ -2,6 +2,7 @@ import {
   normalizeXaiApiBaseUrl,
   normalizeXaiApiKey,
 } from "../shared/xai-connection.js";
+import type { PermissionModePreference } from "../shared/contracts.js";
 
 const MAX_MODEL_ID_LENGTH = 1_024;
 const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
@@ -142,7 +143,7 @@ const PROTOCOL_CONTROL_VALUE_NAMES = new Set([
 export interface GrokAgentLaunchOptions {
   modelId: string | null;
   reasoningEffort?: string | null;
-  alwaysApprove: boolean;
+  permissionMode: PermissionModePreference;
   xaiApiBaseUrl: string | null;
   xaiApiKey?: string;
 }
@@ -160,9 +161,10 @@ export function buildGrokAgentLaunch(
   const xaiApiKey = normalizeXaiApiKey(options.xaiApiKey);
   const modelId = normalizeModelId(options.modelId);
   const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort ?? null);
+  const permissionMode = normalizePermissionMode(options.permissionMode);
   const args = [
     "--permission-mode",
-    options.alwaysApprove ? "bypassPermissions" : "default",
+    permissionMode === "always_approve" ? "bypassPermissions" : permissionMode,
     "agent",
     // The desktop connection owns its endpoint, credentials, model, and
     // permission policy. A shared Grok leader could have been started with a
@@ -180,7 +182,7 @@ export function buildGrokAgentLaunch(
   if (xaiApiBaseUrl) {
     args.push("--xai-api-base-url", xaiApiBaseUrl);
   }
-  if (options.alwaysApprove) {
+  if (permissionMode === "always_approve") {
     args.push("--always-approve");
   }
   args.push("stdio");
@@ -199,6 +201,13 @@ export function buildGrokAgentLaunch(
     delete env.GROK_CODE_XAI_API_KEY;
   }
   return { args, env };
+}
+
+function normalizePermissionMode(value: unknown): PermissionModePreference {
+  if (value !== "default" && value !== "auto" && value !== "always_approve") {
+    throw new TypeError("permissionMode must be default, auto, or always_approve.");
+  }
+  return value;
 }
 
 function normalizeModelId(value: string | null): string | null {

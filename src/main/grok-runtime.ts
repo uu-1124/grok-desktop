@@ -35,6 +35,7 @@ import type {
   ModelInfo,
   PermissionRequestPayload,
   PermissionResponsePayload,
+  PermissionModePreference,
   PromptRequest,
   RuntimeCapabilities,
   RuntimeSnapshot,
@@ -73,7 +74,7 @@ import {
 import type { PreparedPromptContextFile } from "./workspace-files.js";
 
 const CLIENT_NAME = "Grok Desktop";
-const CLIENT_VERSION = "0.1.0";
+const CLIENT_VERSION = "0.1.1";
 const CONNECT_TIMEOUT_MS = 20_000;
 const SPAWN_TIMEOUT_MS = 5_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
@@ -92,7 +93,7 @@ interface NormalizedConnectRequest {
   executablePath: string;
   modelId: string | null;
   reasoningEffort: string | null;
-  alwaysApprove: boolean;
+  permissionMode: PermissionModePreference;
   xaiApiBaseUrl: string | null;
   xaiApiKey: string | undefined;
   mcpServers: McpServerConfig[];
@@ -276,7 +277,7 @@ export class GrokRuntime {
       this.loadingSessionUpdates.clear();
       this.updateSnapshot({
         phase: "connecting",
-        permissionMode: normalized.alwaysApprove ? "always_approve" : "default",
+        permissionMode: normalized.permissionMode,
         xaiApiBaseUrl: normalized.xaiApiBaseUrl,
         workspacePath: normalized.workspacePath,
         executablePath: normalized.executablePath,
@@ -379,7 +380,7 @@ export class GrokRuntime {
 
       this.updateSnapshot({
         phase: "ready",
-        permissionMode: normalized.alwaysApprove ? "always_approve" : "default",
+        permissionMode: normalized.permissionMode,
         workspacePath: normalized.workspacePath,
         executablePath: normalized.executablePath,
         grokVersion: initializationState.grokVersion,
@@ -1663,6 +1664,9 @@ async function normalizeConnectRequest(request: ConnectRequest): Promise<Normali
   if (request.alwaysApprove !== undefined && typeof request.alwaysApprove !== "boolean") {
     throw new TypeError("alwaysApprove must be a boolean.");
   }
+  const permissionMode = request.permissionMode === undefined
+    ? request.alwaysApprove ? "always_approve" : "default"
+    : requirePermissionMode(request.permissionMode);
   const xaiApiBaseUrl = normalizeXaiApiBaseUrl(request.xaiApiBaseUrl) ?? null;
   const xaiApiKey = normalizeXaiApiKey(request.xaiApiKey);
   const mcpServers = await canonicalizeMcpServerExecutables(
@@ -1675,11 +1679,18 @@ async function normalizeConnectRequest(request: ConnectRequest): Promise<Normali
     executablePath,
     modelId,
     reasoningEffort,
-    alwaysApprove: request.alwaysApprove ?? false,
+    permissionMode,
     xaiApiBaseUrl,
     xaiApiKey,
     mcpServers,
   };
+}
+
+function requirePermissionMode(value: unknown): PermissionModePreference {
+  if (value !== "default" && value !== "auto" && value !== "always_approve") {
+    throw new TypeError("permissionMode must be default, auto, or always_approve.");
+  }
+  return value;
 }
 
 async function requireExistingPath(

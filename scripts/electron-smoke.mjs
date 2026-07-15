@@ -33,6 +33,7 @@ const MISSING_SESSION_TITLE = "Electron smoke · 不存在的历史任务";
 const CUSTOM_BASE_URL = "http://127.0.0.1:65534/v1";
 const HISTORY_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-history-recovery.png");
 const AUTH_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-native-auth.png");
+const PERMISSION_CONTROL_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-permission-control.png");
 const PERMISSION_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-permission-light.png");
 const PERMISSION_NARROW_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-permission-1280x720.png");
 const PERMISSION_FIXTURE_HTML = `
@@ -209,12 +210,15 @@ try {
     document.querySelector('button[aria-label="打开设置"]')?.click();
     await waitFor(() => document.querySelector(".native-auth-summary"));
     const card = document.querySelector(".native-auth-summary");
+    const permissionOptions = [...document.querySelectorAll(".permission-mode-settings [data-permission-option], .permission-mode-settings > button")];
     return {
       methods: [...card.querySelectorAll("li")].map((item) => item.textContent),
       buttonText: card.querySelector("button")?.textContent ?? "",
       buttonDisabled: card.querySelector("button")?.disabled ?? true,
       savedBaseUrl: document.querySelector("#xai-api-base-url")?.value ?? "missing",
       bodyContainsAuthenticateButton: document.body.innerText.includes("authenticate"),
+      permissionOptions: permissionOptions.map((button) => button.textContent.trim()),
+      selectedPermission: permissionOptions.find((button) => button.getAttribute("aria-checked") === "true")?.textContent.trim() ?? "",
     };
   })()`);
 
@@ -224,7 +228,75 @@ try {
   assert.equal(nativeAuth.bodyContainsAuthenticateButton, false);
   assert.equal(nativeAuth.methods.some((method) => method.includes("API Key")), true);
   assert.equal(nativeAuth.methods.some((method) => method.includes("Grok 登录")), true);
+  assert.equal(nativeAuth.permissionOptions.length, 3);
+  assert.match(nativeAuth.permissionOptions[0], /逐项授权/u);
+  assert.match(nativeAuth.permissionOptions[1], /自动/u);
+  assert.match(nativeAuth.permissionOptions[2], /完全授权/u);
+  assert.match(nativeAuth.selectedPermission, /自动/u);
   await cdp.captureScreenshot(AUTH_SCREENSHOT);
+
+  const permissionControl = await cdp.evaluate(`(async () => {
+    const waitFor = async (predicate, timeout = 20000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) throw new Error("Timed out waiting for permission control");
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+    };
+    document.querySelector('.settings-modal button[aria-label="关闭设置"]')?.click();
+    await waitFor(() => !document.querySelector(".settings-modal"));
+    const trigger = document.querySelector(".permission-mode-control__trigger");
+    if (!trigger) throw new Error("Composer permission trigger was not rendered");
+    trigger.click();
+    await waitFor(() => document.querySelector(".permission-mode-menu"));
+    const options = [...document.querySelectorAll("[data-permission-option]")];
+    return {
+      triggerText: trigger.textContent.trim(),
+      triggerMode: trigger.closest(".permission-mode-control")?.dataset.mode ?? "",
+      options: options.map((button) => ({
+        id: button.dataset.permissionOption,
+        text: button.textContent.trim(),
+        selected: button.getAttribute("aria-checked"),
+      })),
+      phase: document.querySelector(".app")?.dataset.phase ?? "",
+    };
+  })()`);
+
+  assert.equal(permissionControl.triggerText.includes("权限：自动"), true);
+  assert.equal(permissionControl.triggerMode, "auto");
+  assert.deepEqual(permissionControl.options.map((option) => option.id), ["default", "auto", "always_approve"]);
+  assert.equal(permissionControl.options.find((option) => option.id === "auto")?.selected, "true");
+  assert.equal(permissionControl.phase, "ready");
+  await cdp.captureScreenshot(PERMISSION_CONTROL_SCREENSHOT);
+
+  const permissionDangerGuard = await cdp.evaluate(`(async () => {
+    const waitFor = async (predicate, timeout = 10000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) throw new Error("Timed out waiting for permission guard");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    };
+    document.querySelector('[data-permission-option="always_approve"]')?.click();
+    await waitFor(() => document.querySelector(".permission-mode-confirm"));
+    const modeBeforeConfirmation = document.querySelector(".permission-mode-control")?.dataset.mode ?? "";
+    const phaseBeforeConfirmation = document.querySelector(".app")?.dataset.phase ?? "";
+    [...document.querySelectorAll(".permission-mode-confirm button")].find((button) => button.textContent.trim() === "取消")?.click();
+    const root = document.querySelector(".permission-mode-control");
+    root?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await waitFor(() => !document.querySelector(".permission-mode-menu"));
+    return {
+      modeBeforeConfirmation,
+      phaseBeforeConfirmation,
+      menuClosed: !document.querySelector(".permission-mode-menu"),
+      focusRestored: document.activeElement?.classList.contains("permission-mode-control__trigger") ?? false,
+    };
+  })()`);
+
+  assert.equal(permissionDangerGuard.modeBeforeConfirmation, "auto");
+  assert.equal(permissionDangerGuard.phaseBeforeConfirmation, "ready");
+  assert.equal(permissionDangerGuard.menuClosed, true);
+  assert.equal(permissionDangerGuard.focusRestored, true);
 
   const permissionVisual = await cdp.evaluate(`(() => {
     document.body.insertAdjacentHTML("beforeend", ${JSON.stringify(PERMISSION_FIXTURE_HTML)});
@@ -317,6 +389,8 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 75));
       }
     };
+    document.querySelector('button[aria-label="打开设置"]')?.click();
+    await waitFor(() => document.querySelector(".native-auth-summary button"));
     document.querySelector(".native-auth-summary button")?.click();
     await waitFor(() => document.querySelector(".terminal-panel"));
     return {
@@ -340,8 +414,10 @@ try {
     nativeAuth,
     permissionVisual,
     permissionNarrow,
+    permissionControl,
+    permissionDangerGuard,
     terminal,
-    screenshots: [HISTORY_SCREENSHOT, AUTH_SCREENSHOT, PERMISSION_SCREENSHOT, PERMISSION_NARROW_SCREENSHOT],
+    screenshots: [HISTORY_SCREENSHOT, AUTH_SCREENSHOT, PERMISSION_CONTROL_SCREENSHOT, PERMISSION_SCREENSHOT, PERMISSION_NARROW_SCREENSHOT],
   }, null, 2));
 } finally {
   if (cdp) {
@@ -376,6 +452,7 @@ async function writeSmokeSettings(userDataDirectory) {
     settings: {
       grokExecutablePath: GROK_PATH,
       xaiApiBaseUrl: CUSTOM_BASE_URL,
+      permissionMode: "auto",
       lastWorkspacePath: TEST_WORKSPACE,
       recentWorkspaces: [{
         path: TEST_WORKSPACE,

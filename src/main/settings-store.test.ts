@@ -55,6 +55,7 @@ describe("SettingsStore", () => {
 
     expect(snapshot.grokExecutablePath).toBe(executable);
     expect(snapshot.xaiApiBaseUrl).toBe("https://api.example.com/v1");
+    expect(snapshot.permissionMode).toBe("default");
     expect(snapshot.recentWorkspaces).toEqual([
       expect.objectContaining({ path: workspace, label: "Current label" }),
     ]);
@@ -70,6 +71,34 @@ describe("SettingsStore", () => {
     const serialized = await readFile(path.join(root, "settings.json"), "utf8");
     expect(serialized).toContain("https://api.example.com/v1");
     expect(serialized).not.toMatch(/token|api[_-]?key|credential/iu);
+  });
+
+  it("persists the user-selected Grok permission mode across desktop restarts", async () => {
+    const { root, store } = await createStore();
+
+    await store.setPermissionMode("auto");
+
+    const restored = new SettingsStore(root);
+    await restored.load();
+    expect(restored.getSnapshot().permissionMode).toBe("auto");
+
+    await restored.setPermissionMode("always_approve");
+    const unrestricted = new SettingsStore(root);
+    await unrestricted.load();
+    expect(unrestricted.getSnapshot().permissionMode).toBe("always_approve");
+
+    await unrestricted.setPermissionMode("default");
+    const reset = new SettingsStore(root);
+    await reset.load();
+    expect(reset.getSnapshot().permissionMode).toBe("default");
+  });
+
+  it("rejects an unknown permission preference without changing the safe default", async () => {
+    const { store } = await createStore();
+    await expect(store.setPermissionMode("unknown" as "default")).rejects.toThrow(
+      "Invalid permissionMode",
+    );
+    expect(store.getSnapshot().permissionMode).toBe("default");
   });
 
   it("preserves significant path whitespace instead of merging distinct workspaces", async () => {
@@ -109,6 +138,7 @@ describe("SettingsStore", () => {
     expect(restored.getSnapshot()).toEqual({
       grokExecutablePath: null,
       xaiApiBaseUrl: null,
+      permissionMode: "default",
       lastWorkspacePath: null,
       recentWorkspaces: [],
       recentSessions: [],
@@ -200,6 +230,30 @@ describe("SettingsStore", () => {
     await restored.load();
 
     expect(restored.getSnapshot().xaiApiBaseUrl).toBeNull();
+    expect(restored.getSnapshot().permissionMode).toBe("default");
+  });
+
+  it("safely falls back to per-operation approval for an unknown stored permission mode", async () => {
+    const { root } = await createStore();
+    await writeFile(
+      path.join(root, "settings.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        settings: {
+          grokExecutablePath: null,
+          xaiApiBaseUrl: null,
+          permissionMode: "forged-unrestricted-mode",
+          lastWorkspacePath: null,
+          recentWorkspaces: [],
+          recentSessions: [],
+        },
+      }),
+      "utf8",
+    );
+
+    const restored = new SettingsStore(root);
+    await restored.load();
+    expect(restored.getSnapshot().permissionMode).toBe("default");
   });
 
   it("drops forged API keys and MCP configuration instead of persisting them", async () => {

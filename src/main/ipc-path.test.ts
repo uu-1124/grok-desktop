@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { identifierSchema, IPC_CHANNELS, pathSchema } from "./ipc";
+import { identifierSchema, IPC_CHANNELS, pathSchema, permissionModeSchema } from "./ipc";
 
 describe("IPC path boundary", () => {
   it("validates non-empty paths without rewriting significant whitespace", () => {
@@ -20,5 +20,14 @@ describe("recent session removal IPC boundary", () => {
     expect(identifierSchema.parse(" session-1 ")).toBe("session-1");
     expect(() => identifierSchema.parse("   ")).toThrow();
     expect(() => identifierSchema.parse("x".repeat(1_025))).toThrow();
+  });
+});
+
+describe("permission mode IPC boundary", () => {
+  it("uses a dedicated typed channel and rejects modes Grok does not advertise", () => {
+    expect(IPC_CHANNELS.setPermissionMode).toBe("grok-desktop:set-permission-mode");
+    expect(permissionModeSchema.parse("auto")).toBe("auto");
+    expect(() => permissionModeSchema.parse("bypassPermissions")).toThrow();
+    expect(() => permissionModeSchema.parse("unknown")).toThrow();
   });
 });

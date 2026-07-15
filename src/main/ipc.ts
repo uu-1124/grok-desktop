@@ -17,6 +17,7 @@ import type {
   ContextFileReference,
   GrokInstallation,
   PermissionResponsePayload,
+  PermissionModePreference,
   PromptRequest,
   RuntimeSyncPayload,
   SessionReadyPayload,
@@ -49,6 +50,7 @@ export const IPC_CHANNELS = {
   chooseExecutable: "grok-desktop:choose-executable",
   chooseMcpExecutable: "grok-desktop:choose-mcp-executable",
   setXaiApiBaseUrl: "grok-desktop:set-xai-api-base-url",
+  setPermissionMode: "grok-desktop:set-permission-mode",
   connect: "grok-desktop:connect",
   disconnect: "grok-desktop:disconnect",
   createSession: "grok-desktop:create-session",
@@ -77,6 +79,7 @@ const pathSchema = z.string()
   .refine((value) => value.trim().length > 0 && !value.includes("\0"));
 export { pathSchema };
 export const identifierSchema = nonEmptyText(1_024);
+export const permissionModeSchema = z.enum(["default", "auto", "always_approve"]);
 const xaiApiBaseUrlSchema = z.union([z.string(), z.null()]).transform((value, context) => {
   try {
     return normalizeXaiApiBaseUrl(value) ?? null;
@@ -107,6 +110,7 @@ const connectSchema = z.strictObject({
   executablePath: pathSchema.optional(),
   modelId: identifierSchema.optional(),
   reasoningEffort: identifierSchema.optional(),
+  permissionMode: permissionModeSchema.optional(),
   alwaysApprove: z.boolean().optional(),
   xaiApiBaseUrl: xaiApiBaseUrlSchema.optional(),
   xaiApiKey: xaiApiKeySchema.optional(),
@@ -339,6 +343,15 @@ export function registerIpcHandlers({
     },
   );
 
+  registerValidated<PermissionModePreference, PermissionModePreference>(
+    IPC_CHANNELS.setPermissionMode,
+    permissionModeSchema,
+    async (permissionMode) => {
+      await settings.setPermissionMode(permissionMode);
+      return permissionMode;
+    },
+  );
+
   registerValidated<ConnectRequest, ConnectResult>(
     IPC_CHANNELS.connect,
     connectSchema,
@@ -349,6 +362,7 @@ export function registerIpcHandlers({
       const workspacePath = await requireDirectory(request.workspacePath);
       const installation = await resolveTrustedInstallation(request.executablePath);
       const storedXaiApiBaseUrl = settings.getSnapshot().xaiApiBaseUrl;
+      const storedPermissionMode = settings.getSnapshot().permissionMode;
       const xaiApiBaseUrl = normalizeXaiApiBaseUrl(
         request.xaiApiBaseUrl === undefined
           ? storedXaiApiBaseUrl
@@ -363,6 +377,10 @@ export function registerIpcHandlers({
         ...request,
         workspacePath,
         executablePath: installation.executablePath,
+        permissionMode: request.permissionMode
+          ?? (request.alwaysApprove === undefined
+            ? storedPermissionMode
+            : request.alwaysApprove ? "always_approve" : "default"),
         xaiApiBaseUrl,
         ...(mcpServers ? { mcpServers } : {}),
       };
@@ -394,13 +412,20 @@ export function registerIpcHandlers({
         xaiApiBaseUrlPersisted = false;
         console.warn("Grok Desktop connected, but could not persist the API base URL.");
       }
+      let permissionModePersisted = true;
+      try {
+        await settings.setPermissionMode(normalizedRequest.permissionMode ?? "default");
+      } catch {
+        permissionModePersisted = false;
+        console.warn("Grok Desktop connected, but could not persist the permission mode.");
+      }
       await persistNonCritical(
         Promise.all([
           settings.setGrokExecutablePath(installation.executablePath),
           settings.recordWorkspace(workspacePath),
         ]).then(() => undefined),
       );
-      return { snapshot, xaiApiBaseUrlPersisted };
+      return { snapshot, xaiApiBaseUrlPersisted, permissionModePersisted };
     },
   );
 

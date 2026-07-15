@@ -46,8 +46,9 @@ Electron main process
 - 启动参数：`grok agent [options] stdio`，当前首选 stdio，不开放本地端口。
 - 桌面端显式使用 `--no-leader` 启动独立 Agent，确保本次连接选择的 API Base URL、
   内存态 API Key、模型和权限模式不会被已有共享 Leader 的配置替代。
-- 默认在根命令显式传入 `--permission-mode default`，避免继承 Grok 全局配置中的
-  始终批准状态；用户主动启用时才传 `bypassPermissions` 与 `--always-approve`。
+- 权限偏好保存为 `default | auto | always_approve`。启动时分别映射到 Grok 原生
+  `default`、`auto` 和 `bypassPermissions + --always-approve`；旧设置或未知值安全回退
+  `default`，不会由桌面端自行判断工具风险。
 - 生命周期：`initialize → session/new|session/load → session/prompt → updates`。
 - “新任务”先进入 Renderer 的工作区草稿态，第一次实际发送时才调用 `session/new`，避免
   仅浏览或误触就制造空 Grok 会话。若 Grok 尚未返回标题，Renderer 只提交固定分类式临时
@@ -120,7 +121,8 @@ Electron main process
   fragment、hop-by-hop Header、控制字符和非 ASCII Header 值，并限制服务器数量、
   单服务器及总 Header 字节预算。用户把 URL 改到新 Origin 时，Renderer 会从设置草稿
   移除旧 Header；真正网络请求仍由外部 `grok.exe` 执行。
-- 权限决定完全使用 Agent 返回的 option ID；桌面端不自行绕过 Grok 策略。
+- 权限决定完全使用 Agent 返回的 option ID；三档进程策略仅映射 Grok 原生模式，桌面端
+  不自行批准单次 ACP 权限请求，也不伪造 `allow_always`。
 - 未识别事件可以记录为诊断信息，但不能导致崩溃或静默授权。
 
 ### PTY compatibility host

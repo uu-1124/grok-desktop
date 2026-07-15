@@ -24,7 +24,7 @@ import {
   reportedMcpServerCountLabel,
   requiresXaiApiKeyReentry,
   sessionLoadFailureDetail,
-  resolveRequestedAlwaysApprove,
+  resolveRequestedPermissionMode,
   reasoningEffortsForModel,
   resolvePermissionSource,
   resolveWorkspaceContext,
@@ -363,9 +363,10 @@ describe("connection restore", () => {
 
 describe("connection settings transaction", () => {
   it("uses an explicit permission draft only when settings are applied", () => {
-    expect(resolveRequestedAlwaysApprove(false, { alwaysApprove: true })).toBe(true);
-    expect(resolveRequestedAlwaysApprove(true, { alwaysApprove: false })).toBe(false);
-    expect(resolveRequestedAlwaysApprove(true)).toBe(true);
+    expect(resolveRequestedPermissionMode("default", { permissionMode: "auto" })).toBe("auto");
+    expect(resolveRequestedPermissionMode("auto", { permissionMode: "always_approve" })).toBe("always_approve");
+    expect(resolveRequestedPermissionMode("always_approve")).toBe("always_approve");
+    expect(resolveRequestedPermissionMode("default", undefined, "auto")).toBe("auto");
   });
 });
 
