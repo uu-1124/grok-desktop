@@ -8,6 +8,7 @@ import {
   getActiveModelLabel,
   getAuthMethodPresentations,
   getConversationAlerts,
+  grokConnectionErrorMessage,
   getXaiConnectionBadge,
   getXaiApiCredentialScope,
   getUsageDetailRows,
@@ -40,6 +41,7 @@ import {
   transitionXaiApiKeyForBaseUrl,
   turnOutcomePresentation,
   validateXaiApiBaseUrl,
+  xaiApiBaseUrlAdvisory,
   xaiApiKeyHelpText,
 } from "./App";
 import {
@@ -87,6 +89,28 @@ describe("xAI connection settings", () => {
     expect(xaiApiKeyHelpText(" ")).toContain("原生登录或继承凭据");
     expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("不会继承");
     expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("明确输入");
+  });
+
+  it("advises remote root endpoints without rewriting valid custom URLs", () => {
+    expect(xaiApiBaseUrlAdvisory("https://gateway.example.com")).toContain("/v1");
+    expect(xaiApiBaseUrlAdvisory("https://gateway.example.com/")).toContain("API 路径");
+    expect(xaiApiBaseUrlAdvisory("https://gateway.example.com/v1")).toBeNull();
+    expect(xaiApiBaseUrlAdvisory("http://localhost:8080")).toBeNull();
+    expect(xaiApiBaseUrlAdvisory(" ")).toBeNull();
+  });
+
+  it("turns ACP decode timeouts into an actionable endpoint error", () => {
+    const error = new Error(
+      'Unable to connect to Grok: Timed out while initializing the Grok ACP connection. Grok reported: WARN Failed to fetch models: Network(reqwest::Error { kind: Decode, source: Error("expected value", line: 1, column: 1) })',
+    );
+    const message = grokConnectionErrorMessage(
+      error,
+      "https://gateway.example.com",
+    );
+
+    expect(message).toContain("非 JSON");
+    expect(message).toContain("/v1");
+    expect(message).not.toContain("reqwest");
   });
 
   it("presents only the authentication methods advertised for Grok's default endpoint", () => {

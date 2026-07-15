@@ -394,6 +394,41 @@ export function validateXaiApiBaseUrl(value: string): string | null {
   return "URL 不符合安全连接规则";
 }
 
+export function xaiApiBaseUrlAdvisory(value: string): string | null {
+  const normalized = value.trim();
+  if (!normalized) return null;
+
+  try {
+    const baseUrl = normalizeSharedXaiApiBaseUrl(normalized);
+    if (typeof baseUrl !== "string" || isLoopbackXaiApiBaseUrl(baseUrl)) return null;
+    if (new URL(baseUrl).pathname !== "/") return null;
+  } catch {
+    return null;
+  }
+
+  return "当前地址没有 API 路径。OpenAI/xAI 兼容网关通常需要以 /v1 结尾，请按服务商文档确认。";
+}
+
+export function grokConnectionErrorMessage(error: unknown, baseUrl: string): string {
+  const raw = error instanceof Error && error.message
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : "";
+  const advisory = xaiApiBaseUrlAdvisory(baseUrl);
+  const returnedNonJson = /(?:kind:\s*Decode|expected value[^\n]*line:\s*1[^\n]*column:\s*1)/iu.test(raw);
+
+  if (returnedNonJson) {
+    return advisory
+      ? `无法连接 Grok：API Base URL 返回了网页或其他非 JSON 响应。${advisory}`
+      : "无法连接 Grok：API Base URL 返回了网页或其他非 JSON 响应。请确认地址指向兼容 API 根路径（通常以 /v1 结尾）。";
+  }
+  if (/Timed out while initializing the Grok ACP connection/iu.test(raw) && advisory) {
+    return `无法连接 Grok：ACP 初始化超时。${advisory}`;
+  }
+  return userFacingErrorMessage(error, "项目连接失败");
+}
+
 export function redactSensitiveText(value: string, secret: string): string {
   const normalizedSecret = normalizeXaiApiKey(secret);
   if (!normalizedSecret) return value;
@@ -1562,7 +1597,7 @@ function App() {
       return snapshot;
     } catch (error) {
       pushNotice(
-        redactSensitiveText(userFacingErrorMessage(error, "项目连接失败"), requestedApiKey),
+        redactSensitiveText(grokConnectionErrorMessage(error, requestedBaseUrl), requestedApiKey),
         "error",
       );
       return null;
@@ -3151,6 +3186,7 @@ function SettingsModal({
   );
   const [showApiKey, setShowApiKey] = useState(false);
   const baseUrlError = validateXaiApiBaseUrl(draftBaseUrl);
+  const baseUrlAdvisory = baseUrlError ? null : xaiApiBaseUrlAdvisory(draftBaseUrl);
   const capabilitiesAuthoritative = runtimeCapabilitiesApplyToExecutable(
     runtime,
     installation?.executablePath,
@@ -3442,7 +3478,11 @@ function SettingsModal({
     if (!connectionBusy) onClose();
   };
 
-  const baseUrlDescription = baseUrlError ? "xai-api-base-url-help xai-api-base-url-error" : "xai-api-base-url-help";
+  const baseUrlDescription = [
+    "xai-api-base-url-help",
+    baseUrlError ? "xai-api-base-url-error" : null,
+    baseUrlAdvisory ? "xai-api-base-url-advisory" : null,
+  ].filter(Boolean).join(" ");
   return (
     <div className="modal-layer settings-layer" role="presentation">
       <section aria-labelledby="settings-title" aria-modal="true" className="modal settings-modal" ref={dialogRef} role="dialog" tabIndex={-1}>
@@ -3482,6 +3522,7 @@ function SettingsModal({
               />
               <small id="xai-api-base-url-help">Base URL 会在连接项目时保存到桌面设置，并用于后续连接；清空后恢复 Grok 默认值。</small>
               {baseUrlError && <small className="settings-field__error" id="xai-api-base-url-error" role="status">{baseUrlError}</small>}
+              {baseUrlAdvisory && <small className="settings-field__notice" id="xai-api-base-url-advisory" role="note">{baseUrlAdvisory}</small>}
             </div>
 
             <div className="settings-field">

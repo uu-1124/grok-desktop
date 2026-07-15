@@ -21,7 +21,7 @@ npm run package
 检查安装包签名与 SHA-256：
 
 ```powershell
-$installer = 'release\Grok-Desktop-Windows-x64-Setup-0.1.1.exe'
+$installer = 'release\Grok-Desktop-Windows-x64-Setup-0.1.2.exe'
 Get-AuthenticodeSignature -LiteralPath $installer
 Get-FileHash -LiteralPath $installer -Algorithm SHA256
 ```
