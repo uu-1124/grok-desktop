@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node", "electron"],
+    "rootDir": "src",
+    "outDir": "dist/main",
+    "sourceMap": true,
+    "declaration": false,
+    "esModuleInterop": true
+  },
+  "include": ["src/main/**/*.ts", "src/main/**/*.cts", "src/shared/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}

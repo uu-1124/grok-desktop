@@ -1,0 +1,98 @@
+{
+  "name": "grok-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local Windows desktop client for the installed Grok coding agent.",
+  "author": "uu-1124",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/uu-1124/grok-desktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/uu-1124/grok-desktop/issues"
+  },
+  "homepage": "https://github.com/uu-1124/grok-desktop#readme",
+  "packageManager": "npm@11.6.1",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "type": "module",
+  "main": "dist/main/main/index.js",
+  "scripts": {
+    "dev": "npm run build:main && concurrently --kill-others-on-fail \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "start": "electron .",
+    "clean:dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/clean-dist.ps1",
+    "build": "npm run clean:dist && npm run typecheck && npm run build:main && npm run build:renderer",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:renderer": "vite build",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:electron": "node scripts/electron-smoke.mjs",
+    "test:electron:package": "npm run package:dir && npm run test:electron",
+    "package": "npm run build && electron-builder --win nsis",
+    "package:dir": "npm run build && electron-builder --dir",
+    "postinstall": "install-electron"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.2.1",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "node-pty": "1.1.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "concurrently": "10.0.3",
+    "cross-env": "10.1.0",
+    "electron": "43.1.0",
+    "electron-builder": "26.15.3",
+    "typescript": "7.0.2",
+    "vite": "8.1.4",
+    "vitest": "4.1.10",
+    "wait-on": "9.0.10"
+  },
+  "build": {
+    "appId": "local.grok.desktop",
+    "productName": "Grok Desktop",
+    "electronDist": "node_modules/electron/dist",
+    "asar": true,
+    "npmRebuild": false,
+    "asarUnpack": [
+      "node_modules/node-pty/**/*"
+    ],
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Grok-Desktop-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Grok Desktop"
+    }
+  }
+}
