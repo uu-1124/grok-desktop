@@ -4,7 +4,7 @@
 `grok.exe`，而是在运行时发现现有安装，并通过 Grok 官方 Agent Client Protocol
 （ACP）建立结构化连接。
 
-> 当前版本：`0.1.2` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
+> 当前版本：`0.1.3` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
 > 尚未进行 Windows 代码签名，公开分发时可能触发 SmartScreen 的未知发布者提示。
 
 源码与版本说明托管在 GitHub；Windows 安装包通过
@@ -19,10 +19,15 @@
   用户选择会保存到桌面设置，完全授权始终使用危险状态并要求显式确认。
 - 每次 ACP 连接使用独立的 Grok Agent，不复用共享 Leader，保证用户在桌面端选择的
   API 地址、内存态 Key、模型和权限策略确实作用于当前连接。
-- 设置页允许用户覆盖 xAI API Base URL；远程地址必须使用 HTTPS，本机回环开发服务可
-  使用 HTTP。Base URL 可以保存，API Key 只保留在当前桌面进程内，不写入配置。
-- 当 Grok 在 ACP 模型元数据中广告思考强度档位时，设置页会动态显示对应选择器；选择值
-  只作用于下一次独立 Grok 连接，不保存，也不会假定任何模型或档位始终可用。
+- 结构化连接只接受用户明确提供的兼容 API Base URL 与 API Key，不使用默认端点、Grok
+  登录或父进程凭据回退。远程地址必须使用 HTTPS，本机回环开发服务可使用 HTTP；Base URL
+  可以保存，API Key 只保留在当前桌面进程内，不写入配置。
+- 设置页使用短生命周期 Grok ACP 连接检测地址并获取模型。检测只尝试同一 Origin 的候选路径：
+  根地址优先尝试 `/v1`，非版本路径保留原路径并补充 `/v1` 候选，已带版本路径则保持原样。
+  修改 URL 或 Key 会立即作废旧模型目录。
+- 模型只来自成功连接的 ACP 响应。设置页可以同时启用多个模型并选择初始模型；Composer
+  附近的模型选择器优先使用 Grok 广告的会话配置能力，否则会重新验证模型并真实重连。
+  思考强度同样只显示当前模型明确广告的档位，不假定任何模型或档位始终可用。
 - Grok 明确广告能力后，桌面端可配置 HTTP、SSE 或 stdio MCP 服务器。URL、Header、
   本地可执行文件、参数和环境变量仅保存在当前桌面进程，并随 `session/new` 与
   `session/load` 交给外部 Grok 进程；当前不开放 MCP-over-ACP。
@@ -31,13 +36,11 @@
   非必要变量置空；这项隔离只覆盖桌面端通过 ACP 注入的 stdio MCP。Grok CLI 自行管理的
   MCP 属于外部运行时配置，不受桌面端环境 mask 管理。stdio 程序仍拥有当前 Windows 用户
   权限，不提供 OS 沙箱。
-- 登录和外部链接只允许交给本机 Google Chrome，不加载远程网页到应用窗口。
-- 默认 API 地址下，设置页会展示 Grok 在 ACP 中实际广告的认证方式；`grok.com` 登录继续由
-  原始终端中的外部 Grok CLI 完成，桌面端不调用无完成契约的登录流程，也不保存认证凭据。
+- 外部 HTTPS 链接只允许交给本机 Google Chrome，不加载远程网页到应用窗口。
 - Composer 可引用当前工作区文件：路径会在主进程重新验证；Grok 广告 embedded context
   时，小型 UTF-8 文本仅随本次 prompt 内嵌，二进制或超大文件退回 ACP ResourceLink。
 - 渲染进程没有 Node.js 权限；进程、文件选择和持久化均由 Electron 主进程负责。
-- 登录凭据、Token 和 Grok 会话正文不写入桌面端配置。
+- API Key、Token 和 Grok 会话正文不写入桌面端配置。
 
 更详细的模块边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -91,10 +94,12 @@ npm run package
 `node_modules/electron/dist`，不会在构建阶段再次下载 Electron。
 
 `npm run test:electron` 直接启动 `release/win-unpacked/Grok Desktop.exe`，使用系统临时目录中的
-隔离 `userData` 和本机已安装的 Grok，通过 Electron CDP 验证历史任务失败恢复、错误文案、
-键盘焦点、本地最近记录移除、ACP 认证方式展示、Composer 三档权限菜单、浅色权限弹窗和原始终端入口。权限视觉检查
-只会临时注入无行为的 DOM 夹具，并在 1280×720 下使用完整四选项验证取消入口和末尾选项
-仍可访问。测试不会发送 Prompt、不会调用 Grok 登录，也不会使用用户真实的桌面端设置。
+隔离 `userData`、运行时随机 API Key、本机已安装的 Grok 和随机回环 Mock API。Electron CDP
+会验证根地址自动匹配 `/v1`、ACP 获取多个模型、Composer 使用所选模型、登录入口不存在，
+以及历史任务失败恢复、错误文案、键盘焦点、本地最近记录移除、三档权限菜单、浅色权限弹窗
+和原始终端入口。权限视觉检查只会临时注入无行为的 DOM 夹具，并在 1280×720 下使用完整
+四选项验证取消入口和末尾选项仍可访问。测试不会发送 Prompt、不会访问真实 API 服务商，
+也不会使用用户真实的桌面端设置。
 若尚未生成 unpacked 应用，可运行：
 
 ```powershell
@@ -114,14 +119,14 @@ npm run test:electron:package
 - 由桌面端打开过的会话 ID、标题与时间戳
 - 窗口和界面偏好
 
-API Key、MCP 服务器配置（含命令、参数与环境变量）及 Header 不写入 `userData`。MCP 配置在当前桌面进程内按
-工作区隔离：切换项目不会携带其他项目的 Header，切回原项目可继续使用，退出应用后
-全部清除。若界面进程单独重载，主进程只返回“当前连接存在 MCP 配置”的非敏感标记，
-不会把服务器 URL 或 Header 回传给新界面；设置页会提示详情无法恢复，应用空配置并
-重新连接后会清除原配置。
+API Key、模型目录、模型启用选择、MCP 服务器配置（含命令、参数与环境变量）及 Header
+不写入 `userData`。MCP 配置在当前桌面进程内按工作区隔离：切换项目不会携带其他项目的
+Header，切回原项目可继续使用，退出应用后全部清除。若界面进程单独重载，主进程只返回
+“当前连接存在 MCP 配置”的非敏感标记，不会把服务器 URL 或 Header 回传给新界面；设置页
+会提示详情无法恢复，应用空配置并重新连接后会清除原配置。
 
 Grok 的配置、凭据、日志与完整会话仍由 Grok 自己管理，位置通常为
-`%USERPROFILE%\.grok`。
+`%USERPROFILE%\.grok`；桌面端不会读取或把其中凭据作为结构化连接的回退来源。
 
 ## 品牌说明
 

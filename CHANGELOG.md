@@ -4,7 +4,46 @@
 
 ## Unreleased
 
+## 0.1.3 - 2026-07-15
+
+### Added
+
+- 设置页新增同源 API 路径检测和基于短生命周期 Grok ACP 的多模型发现。
+- 设置页支持启用多个模型、选择初始模型和模型广告的思考强度；Composer 新增当前模型选择器。
+
+### Changed
+
+- 结构化连接现在只接受用户显式提供的任意兼容 API Base URL + API Key，不再提供 Grok
+  登录 UI、默认端点或继承凭据回退。
+- 根地址优先尝试 `/v1`，其他非版本路径保留原地址并补充同源 `/v1` 候选；成功后保存实际
+  解析出的 Base URL。
+- 可写会话模型通过 ACP 配置切换，只读或进程模型经过重新验证后使用独立 Grok Agent 重连。
+- 模型与路径预检改由短生命周期 Runtime 完成，失败不会替换当前长期连接；权限切换、终端返回
+  和普通重连会继续使用仍已启用的当前模型及匹配的思考强度。
+
+### Security
+
+- API Key 继续只保留在当前进程内；修改 URL 或 Key 会使旧模型目录失效，切换 Origin 会清除
+  旧凭据草稿。
+- 启动 Grok Agent 前按 Windows 不区分大小写的规则清除继承的 Key 与模型端点变量，再把
+  Agent API 和模型目录同时绑定到本次显式 URL + Key，阻止旧环境覆盖或跨 Origin 重定向。
+- 拒绝 ACP 模型 ID、名称或思考强度反射本次 API Key，避免凭据进入进程命令行、Runtime
+  快照或 Renderer 状态。
+- Electron smoke 使用运行时随机 Key 和随机回环 Mock API 验证路径匹配与多模型，不访问真实
+  服务商或用户设置。
+
+## 0.1.2 - 2026-07-15
+
+### Added
+
 - 建立 GitHub 仓库、CI、安全策略和标准发布流程。
+
+### Changed
+
+- Windows 安装包使用明确的 Windows x64 文件名，并完善自定义 API Base URL 诊断。
+
+### Security
+
 - 采用 PolyForm Noncommercial 1.0.0 源码许可，允许非商业使用并禁止未经授权的商用。
 
 ## 0.1.1 - 2026-07-15

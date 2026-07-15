@@ -15,6 +15,8 @@ import type {
   ConnectResult,
   ConnectRequest,
   ContextFileReference,
+  DiscoverModelsRequest,
+  DiscoverModelsResult,
   GrokInstallation,
   PermissionResponsePayload,
   PermissionModePreference,
@@ -27,6 +29,7 @@ import type {
 } from "../shared/contracts.js";
 import { MAX_PROMPT_CONTEXT_FILES } from "../shared/contracts.js";
 import {
+  normalizeRequiredXaiConnection,
   normalizeXaiApiBaseUrl,
   normalizeXaiApiKey,
 } from "../shared/xai-connection.js";
@@ -34,7 +37,11 @@ import { normalizeMcpServers } from "../shared/mcp-config.js";
 import { openHttpsInChrome } from "./chrome.js";
 import type { DesktopEventBus } from "./desktop-event-bus.js";
 import { discoverGrok, inspectGrokExecutable, pathsEqual } from "./grok-discovery.js";
-import { requireMcpExecutablePath, type GrokRuntime } from "./grok-runtime.js";
+import { GrokRuntime, requireMcpExecutablePath } from "./grok-runtime.js";
+import {
+  connectWithXaiApiDiscovery,
+  discoverXaiModels,
+} from "./xai-model-discovery.js";
 import type { SettingsStore } from "./settings-store.js";
 import type { TerminalManager } from "./terminal-manager.js";
 import {
@@ -49,6 +56,7 @@ export const IPC_CHANNELS = {
   chooseContextFiles: "grok-desktop:choose-context-files",
   chooseExecutable: "grok-desktop:choose-executable",
   chooseMcpExecutable: "grok-desktop:choose-mcp-executable",
+  discoverModels: "grok-desktop:discover-models",
   setXaiApiBaseUrl: "grok-desktop:set-xai-api-base-url",
   setPermissionMode: "grok-desktop:set-permission-mode",
   connect: "grok-desktop:connect",
@@ -88,6 +96,16 @@ const xaiApiBaseUrlSchema = z.union([z.string(), z.null()]).transform((value, co
     return z.NEVER;
   }
 });
+const requiredXaiApiBaseUrlSchema = z.string().transform((value, context) => {
+  try {
+    const normalized = normalizeXaiApiBaseUrl(value);
+    if (typeof normalized !== "string") throw new TypeError("Missing API base URL.");
+    return normalized;
+  } catch {
+    context.addIssue({ code: "custom", message: "A valid xAI API base URL is required." });
+    return z.NEVER;
+  }
+});
 const xaiApiKeySchema = z.string().transform((value, context) => {
   try {
     return normalizeXaiApiKey(value) as string;
@@ -105,17 +123,23 @@ const mcpServersSchema = z.unknown().transform((value, context) => {
   }
 });
 
-const connectSchema = z.strictObject({
+export const connectSchema = z.strictObject({
   workspacePath: pathSchema,
   executablePath: pathSchema.optional(),
   modelId: identifierSchema.optional(),
   reasoningEffort: identifierSchema.optional(),
   permissionMode: permissionModeSchema.optional(),
   alwaysApprove: z.boolean().optional(),
-  xaiApiBaseUrl: xaiApiBaseUrlSchema.optional(),
-  xaiApiKey: xaiApiKeySchema.optional(),
+  xaiApiBaseUrl: requiredXaiApiBaseUrlSchema,
+  xaiApiKey: xaiApiKeySchema,
   mcpServers: mcpServersSchema.optional(),
   allowStdioMcpExecution: z.literal(true).optional(),
+});
+export const discoverModelsSchema = z.strictObject({
+  workspacePath: pathSchema,
+  executablePath: pathSchema.optional(),
+  xaiApiBaseUrl: requiredXaiApiBaseUrlSchema,
+  xaiApiKey: xaiApiKeySchema,
 });
 const promptSchema = z.strictObject({
   sessionId: identifierSchema,
@@ -157,6 +181,7 @@ export function registerIpcHandlers({
 }: IpcDependencies): () => void {
   const registeredChannels: string[] = [];
   let discoveredExecutablePath: string | null = null;
+  let modelDiscoveryInProgress = false;
 
   const registerNoPayload = <Result>(
     channel: string,
@@ -334,6 +359,39 @@ export function registerIpcHandlers({
     },
   );
 
+  registerValidated<DiscoverModelsRequest, DiscoverModelsResult>(
+    IPC_CHANNELS.discoverModels,
+    discoverModelsSchema,
+    async (request) => {
+      if (terminal.active) {
+        throw new Error("请先关闭原始终端，再检测结构化 Grok 连接。");
+      }
+      if (modelDiscoveryInProgress) {
+        throw new Error("模型检测正在进行，请等待当前操作完成。");
+      }
+      modelDiscoveryInProgress = true;
+      try {
+        const workspacePath = await requireDirectory(request.workspacePath);
+        const installation = await resolveTrustedInstallation(request.executablePath);
+        const credentials = normalizeRequiredXaiConnection(
+          request.xaiApiBaseUrl,
+          request.xaiApiKey,
+        );
+        return await discoverXaiModels(
+          () => new GrokRuntime(() => undefined, { connectTimeoutMs: 10_000 }),
+          {
+            workspacePath,
+            executablePath: installation.executablePath,
+            permissionMode: "default",
+            ...credentials,
+          },
+        );
+      } finally {
+        modelDiscoveryInProgress = false;
+      }
+    },
+  );
+
   registerValidated<string | null, string | null>(
     IPC_CHANNELS.setXaiApiBaseUrl,
     xaiApiBaseUrlSchema,
@@ -361,13 +419,11 @@ export function registerIpcHandlers({
       }
       const workspacePath = await requireDirectory(request.workspacePath);
       const installation = await resolveTrustedInstallation(request.executablePath);
-      const storedXaiApiBaseUrl = settings.getSnapshot().xaiApiBaseUrl;
       const storedPermissionMode = settings.getSnapshot().permissionMode;
-      const xaiApiBaseUrl = normalizeXaiApiBaseUrl(
-        request.xaiApiBaseUrl === undefined
-          ? storedXaiApiBaseUrl
-          : request.xaiApiBaseUrl,
-      ) ?? null;
+      const credentials = normalizeRequiredXaiConnection(
+        request.xaiApiBaseUrl,
+        request.xaiApiKey,
+      );
       const mcpServers = request.mcpServers
         ? await Promise.all(request.mcpServers.map(async (server) => server.type === "stdio"
           ? { ...server, command: await requireMcpExecutablePath(server.command) }
@@ -381,7 +437,7 @@ export function registerIpcHandlers({
           ?? (request.alwaysApprove === undefined
             ? storedPermissionMode
             : request.alwaysApprove ? "always_approve" : "default"),
-        xaiApiBaseUrl,
+        ...credentials,
         ...(mcpServers ? { mcpServers } : {}),
       };
 
@@ -404,10 +460,14 @@ export function registerIpcHandlers({
         }
       }
 
-      const snapshot = await runtime.connect(normalizedRequest);
+      const snapshot = await connectWithXaiApiDiscovery(
+        () => new GrokRuntime(() => undefined, { connectTimeoutMs: 10_000 }),
+        runtime,
+        normalizedRequest,
+      );
       let xaiApiBaseUrlPersisted = true;
       try {
-        await settings.setXaiApiBaseUrl(xaiApiBaseUrl);
+        await settings.setXaiApiBaseUrl(snapshot.xaiApiBaseUrl);
       } catch {
         xaiApiBaseUrlPersisted = false;
         console.warn("Grok Desktop connected, but could not persist the API base URL.");

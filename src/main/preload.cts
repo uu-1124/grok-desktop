@@ -4,6 +4,7 @@ import type {
   ConnectRequest,
   DesktopApi,
   DesktopEventEnvelope,
+  DiscoverModelsRequest,
   PermissionModePreference,
   PermissionResponsePayload,
   PromptRequest,
@@ -18,6 +19,7 @@ const CHANNELS = {
   chooseContextFiles: "grok-desktop:choose-context-files",
   chooseExecutable: "grok-desktop:choose-executable",
   chooseMcpExecutable: "grok-desktop:choose-mcp-executable",
+  discoverModels: "grok-desktop:discover-models",
   setXaiApiBaseUrl: "grok-desktop:set-xai-api-base-url",
   setPermissionMode: "grok-desktop:set-permission-mode",
   connect: "grok-desktop:connect",
@@ -47,6 +49,8 @@ const api: DesktopApi = Object.freeze({
     ipcRenderer.invoke(CHANNELS.chooseContextFiles, workspacePath),
   chooseExecutable: () => ipcRenderer.invoke(CHANNELS.chooseExecutable),
   chooseMcpExecutable: () => ipcRenderer.invoke(CHANNELS.chooseMcpExecutable),
+  discoverModels: (request: DiscoverModelsRequest) =>
+    ipcRenderer.invoke(CHANNELS.discoverModels, request),
   setXaiApiBaseUrl: (xaiApiBaseUrl: string | null) =>
     ipcRenderer.invoke(CHANNELS.setXaiApiBaseUrl, xaiApiBaseUrl),
   setPermissionMode: (permissionMode: PermissionModePreference) =>

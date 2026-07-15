@@ -118,6 +118,28 @@ describe("Grok renderer redaction boundary", () => {
 
     expect(runtime.getSnapshot().xaiApiKeyConfigured).toBe(false);
   });
+
+  it("rejects reflected API credentials before model metadata reaches renderer state", () => {
+    const events: DesktopEvent[] = [];
+    const runtime = new GrokRuntime((event) => events.push(event));
+    const internals = runtime as unknown as {
+      xaiApiKey: string | null;
+      applyParsedSessionCapabilities(state: {
+        currentModelId: string | null;
+        availableModels: Array<{ id: string; name: string }>;
+        configOptions: [];
+      }): void;
+    };
+    internals.xaiApiKey = "runtime-reflection-key";
+
+    expect(() => internals.applyParsedSessionCapabilities({
+      currentModelId: "model-runtime-reflection-key",
+      availableModels: [{ id: "safe-model", name: "Safe model" }],
+      configOptions: [],
+    })).toThrow(/credentials/u);
+    expect(runtime.getSnapshot().availableModels).toEqual([]);
+    expect(events).toEqual([]);
+  });
 });
 
 describe("Grok session loading", () => {
@@ -236,7 +258,7 @@ describe("Grok MCP session configuration", () => {
     const launch = buildGrokAgentLaunch({
       modelId: null,
       permissionMode: "default",
-      xaiApiBaseUrl: null,
+      xaiApiBaseUrl: "https://gateway.example.com/v1",
       xaiApiKey: "ui-only-xai-secret",
     }, { Path: "C:\\Windows" });
     const mask = mcpEnvironmentMaskFromLaunch(launch.env);

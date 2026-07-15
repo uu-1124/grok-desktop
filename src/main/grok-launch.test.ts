@@ -66,11 +66,37 @@ describe("xAI connection normalization", () => {
 });
 
 describe("Grok agent launch", () => {
+  const explicitConnection = {
+    xaiApiBaseUrl: "https://gateway.example.com/v1",
+    xaiApiKey: "test-key",
+  } as const;
+
+  it("requires an explicit API base URL and API key as one connection pair", () => {
+    expect(() => buildGrokAgentLaunch({
+      modelId: null,
+      permissionMode: "default",
+      xaiApiBaseUrl: null,
+      xaiApiKey: "test-key",
+    })).toThrow(/base URL/u);
+    expect(() => buildGrokAgentLaunch({
+      modelId: null,
+      permissionMode: "default",
+      xaiApiBaseUrl: "https://gateway.example.com/v1",
+    })).toThrow(/API key/u);
+  });
+
   it("passes the base URL as an argument and the API key only through child env", () => {
     const parentEnv: NodeJS.ProcessEnv = {
       KEEP_ME: "present",
       XAI_API_KEY: "parent-test-key",
       GROK_CODE_XAI_API_KEY: "legacy-parent-test-key",
+      GROK_MODELS_BASE_URL: "https://inherited.example.com/v1",
+      GROK_MODELS_LIST_URL: "https://inherited.example.com/private-models",
+      xai_api_key: "lowercase-parent-test-key",
+      Grok_Code_Xai_Api_Key: "mixed-case-legacy-parent-test-key",
+      grok_models_base_url: "https://lowercase-inherited.example.com/v1",
+      Grok_Models_List_Url: "https://mixed-case-inherited.example.com/private-models",
+      grok_xai_api_base_url: "https://lowercase-xai-inherited.example.com/v1",
     };
     const originalParentEnv = { ...parentEnv };
     const launch = buildGrokAgentLaunch(
@@ -97,9 +123,24 @@ describe("Grok agent launch", () => {
     expect(launch.args).not.toContain("child-test-key");
     expect(launch.env).toMatchObject({
       KEEP_ME: "present",
+      GROK_MODELS_BASE_URL: "https://gateway.example.com/v1",
       XAI_API_KEY: "child-test-key",
     });
     expect(launch.env.GROK_CODE_XAI_API_KEY).toBeUndefined();
+    expect(launch.env.GROK_MODELS_LIST_URL).toBeUndefined();
+    expect(Object.entries(launch.env)
+      .filter(([name]) => [
+        "XAI_API_KEY",
+        "GROK_CODE_XAI_API_KEY",
+        "GROK_MODELS_BASE_URL",
+        "GROK_MODELS_LIST_URL",
+        "GROK_XAI_API_BASE_URL",
+      ].includes(name.toUpperCase()))
+      .sort(([left], [right]) => left.localeCompare(right)))
+      .toEqual([
+        ["GROK_MODELS_BASE_URL", "https://gateway.example.com/v1"],
+        ["XAI_API_KEY", "child-test-key"],
+      ]);
     expect(parentEnv).toEqual(originalParentEnv);
   });
 
@@ -114,7 +155,7 @@ describe("Grok agent launch", () => {
     expect(() => buildGrokAgentLaunch({
       modelId,
       permissionMode: "default",
-      xaiApiBaseUrl: null,
+      ...explicitConnection,
     })).toThrow(/modelId/u);
   });
 
@@ -122,7 +163,7 @@ describe("Grok agent launch", () => {
     const launch = buildGrokAgentLaunch({
       modelId: "--always-approve",
       permissionMode: "default",
-      xaiApiBaseUrl: null,
+      ...explicitConnection,
     });
 
     expect(launch.args).toContain("--model=--always-approve");
@@ -134,7 +175,7 @@ describe("Grok agent launch", () => {
       modelId: "grok-build",
       reasoningEffort: "--always-approve",
       permissionMode: "default",
-      xaiApiBaseUrl: null,
+      ...explicitConnection,
     });
 
     expect(launch.args).toContain("--reasoning-effort=--always-approve");
@@ -151,43 +192,48 @@ describe("Grok agent launch", () => {
       modelId: "grok-build",
       reasoningEffort,
       permissionMode: "default",
-      xaiApiBaseUrl: null,
+      ...explicitConnection,
     })).toThrow(/reasoningEffort/u);
   });
 
-  it("preserves Grok's inherited credential behavior for the default endpoint", () => {
-    const launch = buildGrokAgentLaunch(
-      {
-        modelId: null,
+  it("rejects an ACP model ID that reflects the in-memory API key", () => {
+    const apiKey = "reflection/key secret";
+    let error: unknown;
+    try {
+      buildGrokAgentLaunch({
+        modelId: `model-${apiKey}`,
         permissionMode: "default",
-        xaiApiBaseUrl: null,
-      },
-      {
-        KEEP_ME: "present",
-        XAI_API_KEY: "inherited-test-key",
-        GROK_CODE_XAI_API_KEY: "legacy-inherited-test-key",
-      },
-    );
+        xaiApiBaseUrl: explicitConnection.xaiApiBaseUrl,
+        xaiApiKey: apiKey,
+      });
+    } catch (caught) {
+      error = caught;
+    }
 
-    expect(launch.args).toEqual([
-      "--permission-mode",
-      "default",
-      "agent",
-      "--no-leader",
-      "stdio",
-    ]);
-    expect(launch.env).toMatchObject({
-      KEEP_ME: "present",
-      XAI_API_KEY: "inherited-test-key",
-      GROK_CODE_XAI_API_KEY: "legacy-inherited-test-key",
-    });
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toMatch(/credential/u);
+    expect((error as Error).message).not.toContain(apiKey);
+  });
+
+  it("rejects a URL-encoded API key reflected as an ACP reasoning effort", () => {
+    const apiKey = "reflection/key secret";
+    expect(() => buildGrokAgentLaunch({
+      modelId: "safe-model",
+      reasoningEffort: encodeURIComponent(apiKey).replace(
+        /%[0-9A-F]{2}/gu,
+        (escape) => escape.toLowerCase(),
+      ),
+      permissionMode: "default",
+      xaiApiBaseUrl: explicitConnection.xaiApiBaseUrl,
+      xaiApiKey: apiKey,
+    })).toThrow(/credential/u);
   });
 
   it("uses Grok's native auto permission mode without enabling unrestricted approval", () => {
     const launch = buildGrokAgentLaunch({
       modelId: null,
       permissionMode: "auto",
-      xaiApiBaseUrl: null,
+      ...explicitConnection,
     });
 
     expect(launch.args).toEqual([
@@ -195,6 +241,8 @@ describe("Grok agent launch", () => {
       "auto",
       "agent",
       "--no-leader",
+      "--xai-api-base-url",
+      "https://gateway.example.com/v1",
       "stdio",
     ]);
     expect(launch.args).not.toContain("--always-approve");
@@ -204,38 +252,9 @@ describe("Grok agent launch", () => {
     expect(() => buildGrokAgentLaunch({
       modelId: null,
       permissionMode: "unknown" as "default",
-      xaiApiBaseUrl: null,
+      ...explicitConnection,
     })).toThrow(/permissionMode/u);
   });
-
-  it.each([
-    "https://gateway.example.com/v1",
-    "http://localhost:8080/v1",
-  ])(
-    "strips inherited xAI credentials for custom endpoint %s without an explicit key",
-    (xaiApiBaseUrl) => {
-      const parentEnv: NodeJS.ProcessEnv = {
-        KEEP_ME: "present",
-        XAI_API_KEY: "inherited-test-key",
-        GROK_CODE_XAI_API_KEY: "legacy-inherited-test-key",
-      };
-      const originalParentEnv = { ...parentEnv };
-      const launch = buildGrokAgentLaunch(
-        {
-          modelId: null,
-          permissionMode: "default",
-          xaiApiBaseUrl,
-        },
-        parentEnv,
-      );
-
-      expect(launch.args).toContain(xaiApiBaseUrl);
-      expect(launch.env.KEEP_ME).toBe("present");
-      expect(launch.env.XAI_API_KEY).toBeUndefined();
-      expect(launch.env.GROK_CODE_XAI_API_KEY).toBeUndefined();
-      expect(parentEnv).toEqual(originalParentEnv);
-    },
-  );
 
   it("redacts an in-memory key before diagnostic text leaves the runtime", () => {
     const key = "diagnostic/test key";

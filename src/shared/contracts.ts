@@ -123,10 +123,10 @@ export interface ConnectRequest {
   permissionMode?: PermissionModePreference;
   /** @deprecated Compatibility for older renderer builds. Prefer permissionMode. */
   alwaysApprove?: boolean;
-  /** Undefined reuses the saved URL; null clears it after a successful connection. */
-  xaiApiBaseUrl?: string | null;
+  /** Explicit endpoint for this connection. The desktop never falls back to Grok login. */
+  xaiApiBaseUrl: string;
   /** Per-process secret. It must never be copied into settings, snapshots, or events. */
-  xaiApiKey?: string;
+  xaiApiKey: string;
   /** Per-process MCP configuration. Header values must never be persisted or echoed. */
   mcpServers?: McpServerConfig[];
   /** Required literal consent when any stdio MCP executable may be launched. */
@@ -145,6 +145,20 @@ export interface ModelInfo {
   description?: string;
   reasoningEffort?: string;
   reasoningEfforts?: ReasoningEffortInfo[];
+}
+
+export interface DiscoverModelsRequest {
+  workspacePath: string;
+  executablePath?: string;
+  xaiApiBaseUrl: string;
+  /** Per-process secret used only by the short-lived ACP discovery runtime. */
+  xaiApiKey: string;
+}
+
+export interface DiscoverModelsResult {
+  resolvedBaseUrl: string;
+  currentModelId: string | null;
+  models: ModelInfo[];
 }
 
 export interface ReasoningEffortInfo {
@@ -390,6 +404,7 @@ export interface DesktopApi {
   chooseContextFiles(workspacePath: string): Promise<ContextFileReference[]>;
   chooseExecutable(): Promise<GrokInstallation | null>;
   chooseMcpExecutable(): Promise<string | null>;
+  discoverModels(request: DiscoverModelsRequest): Promise<DiscoverModelsResult>;
   setXaiApiBaseUrl(xaiApiBaseUrl: string | null): Promise<string | null>;
   setPermissionMode(mode: PermissionModePreference): Promise<PermissionModePreference>;
   connect(request: ConnectRequest): Promise<ConnectResult>;

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import {
   access,
   mkdir,
@@ -30,9 +32,9 @@ const TEST_WORKSPACE = path.resolve(process.env.GROK_E2E_WORKSPACE || WORKSPACE_
 const KEEP_USER_DATA = process.env.GROK_E2E_KEEP_USER_DATA === "1";
 const MISSING_SESSION_ID = "electron-smoke-missing-session";
 const MISSING_SESSION_TITLE = "Electron smoke · 不存在的历史任务";
-const CUSTOM_BASE_URL = "http://127.0.0.1:65534/v1";
+const SMOKE_API_KEY = `smoke-${randomUUID()}`;
 const HISTORY_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-history-recovery.png");
-const AUTH_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-native-auth.png");
+const CONNECTION_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-api-models.png");
 const PERMISSION_CONTROL_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-permission-control.png");
 const PERMISSION_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-permission-light.png");
 const PERMISSION_NARROW_SCREENSHOT = path.join(ARTIFACTS_DIR, "electron-smoke-permission-1280x720.png");
@@ -61,9 +63,10 @@ await requireRegularFile(GROK_PATH, "Installed Grok executable");
 await requireDirectory(TEST_WORKSPACE, "Smoke workspace");
 await mkdir(ARTIFACTS_DIR, { recursive: true });
 
+const mockApi = await startMockApi();
 const userDataPath = await mkdtemp(path.join(os.tmpdir(), "grok-desktop-smoke-"));
 assertSafeTemporaryUserDataPath(userDataPath);
-await writeSmokeSettings(userDataPath);
+await writeSmokeSettings(userDataPath, mockApi.rootBaseUrl);
 
 const childEnvironment = { ...process.env };
 delete childEnvironment.XAI_API_KEY;
@@ -90,6 +93,103 @@ try {
   await cdp.send("Runtime.enable");
   await cdp.send("Page.enable");
 
+  const connectionSetup = await cdp.evaluate(`(async () => {
+    let stage = "settings modal";
+    const waitFor = async (predicate, timeout = 50000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) {
+          throw new Error("Timed out waiting for explicit API model setup during " + stage);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+    };
+    const setInputValue = (element, value) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(element, value);
+      element?.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const setSelectValue = (element, value) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+      setter?.call(element, value);
+      element?.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+
+    await waitFor(() => document.querySelector(".settings-modal"));
+    stage = "model discovery button";
+    const baseUrlInput = document.querySelector("#xai-api-base-url");
+    const apiKeyInput = document.querySelector("#xai-api-key");
+    const initialBaseUrl = baseUrlInput?.value ?? "missing";
+    const apiKeyInitiallyEmpty = apiKeyInput?.value === "";
+    setInputValue(apiKeyInput, ${JSON.stringify(SMOKE_API_KEY)});
+    await waitFor(() => ![...document.querySelectorAll(".model-discovery-actions button")].find(
+      (button) => button.textContent.includes("获取模型"),
+    )?.disabled);
+    stage = "model discovery result";
+    [...document.querySelectorAll(".model-discovery-actions button")].find(
+      (button) => button.textContent.includes("获取模型"),
+    )?.click();
+    await waitFor(() => document.querySelector(
+      ".model-discovery-status.is-ready, .model-discovery-status.is-error",
+    ));
+    const discoveryError = document.querySelector(".model-discovery-status.is-error")?.textContent?.trim();
+    if (discoveryError) {
+      throw new Error("Model discovery failed: " + discoveryError);
+    }
+    const resolvedBaseUrl = baseUrlInput?.value ?? "missing";
+    const modelItems = [...document.querySelectorAll(".model-catalog__item")];
+    const smokeModelItems = modelItems.filter((item) => item.textContent.includes("smoke-model-"));
+    const modelSelect = document.querySelector("#grok-model");
+    setSelectValue(modelSelect, "smoke-model-b");
+    stage = "selected model state";
+    await waitFor(() => modelSelect?.value === "smoke-model-b");
+    const applyButton = [...document.querySelectorAll(".settings-modal > footer button")].find(
+      (button) => button.textContent.includes("应用并重新连接"),
+    );
+    if (!applyButton || applyButton.disabled) throw new Error("Connection apply button remained disabled");
+    applyButton.click();
+    stage = "settings close after reconnect";
+    await waitFor(() => !document.querySelector(".settings-modal"));
+    stage = "ready runtime phase";
+    await waitFor(() => document.querySelector(".app")?.dataset.phase === "ready");
+    stage = "composer model sync";
+    await waitFor(() => document.querySelector('.composer-model-select select')?.value === "smoke-model-b");
+    document.querySelector('button[aria-label="打开设置"]')?.click();
+    await waitFor(() => document.querySelector(".settings-modal"));
+    return {
+      initialBaseUrl,
+      apiKeyInitiallyEmpty,
+      resolvedBaseUrl,
+      models: smokeModelItems.map((item) => ({
+        text: item.textContent.trim(),
+        enabled: item.querySelector("input")?.checked ?? false,
+      })),
+      selectedModel: document.querySelector("#grok-model")?.value ?? "",
+      composerModel: document.querySelector('.composer-model-select select')?.value ?? "",
+      nativeLoginVisible: document.body.innerText.includes("Grok 原生认证") ||
+        document.body.innerText.includes("Grok 登录"),
+      apiKeyVisible: document.querySelector("#xai-api-key")?.type === "text",
+    };
+  })()`);
+
+  assert.equal(connectionSetup.initialBaseUrl, mockApi.rootBaseUrl);
+  assert.equal(connectionSetup.apiKeyInitiallyEmpty, true);
+  assert.equal(connectionSetup.resolvedBaseUrl, mockApi.versionedBaseUrl);
+  assert.equal(connectionSetup.models.length, 2);
+  assert.equal(connectionSetup.models.every((model) => model.enabled), true);
+  assert.equal(connectionSetup.selectedModel, "smoke-model-b");
+  assert.equal(connectionSetup.composerModel, "smoke-model-b");
+  assert.equal(connectionSetup.nativeLoginVisible, false);
+  assert.equal(connectionSetup.apiKeyVisible, false);
+  assert.equal(mockApi.getAuthorizedModelRequestCount() >= 1, true);
+  await cdp.captureScreenshot(CONNECTION_SCREENSHOT);
+  await cdp.evaluate(`(async () => {
+    document.querySelector('.settings-modal button[aria-label="关闭设置"]')?.click();
+    while (document.querySelector(".settings-modal")) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  })()`);
+
   const historyRecovery = await cdp.evaluate(`(async () => {
     const waitFor = async (predicate, timeout = 35000) => {
       const started = Date.now();
@@ -109,13 +209,16 @@ try {
     row.click();
     await waitFor(() => document.querySelector(".session-load-recovery"));
     const firstDetail = document.querySelector(".session-load-recovery small")?.textContent ?? "";
-    const firstToastCount = document.querySelectorAll(".toast").length;
+    const matchingToastCount = () => [...document.querySelectorAll(".toast")].filter(
+      (toast) => firstDetail && toast.textContent.includes(firstDetail),
+    ).length;
+    const firstToastCount = matchingToastCount();
     await waitFor(() => !document.querySelector(".session-load-recovery__actions button")?.disabled);
     document.querySelector(".session-load-recovery__actions button")?.click();
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     await waitFor(() => document.querySelector(".session-load-recovery") &&
       !document.querySelector(".session-load-recovery__actions button")?.disabled);
-    const retryToastCount = document.querySelectorAll(".toast").length;
+    const retryToastCount = matchingToastCount();
     const removeButton = [...document.querySelectorAll(".session-load-recovery__actions button")].find(
       (button) => button.textContent.includes("从列表移除"),
     );
@@ -186,55 +289,6 @@ try {
     "Removed desktop history was not persisted",
   );
 
-  const nativeAuth = await cdp.evaluate(`(async () => {
-    const waitFor = async (predicate, timeout = 20000) => {
-      const started = Date.now();
-      while (!predicate()) {
-        if (Date.now() - started > timeout) throw new Error("Timed out waiting for native auth UI");
-        await new Promise((resolve) => setTimeout(resolve, 75));
-      }
-    };
-    document.querySelector('button[aria-label="打开设置"]')?.click();
-    await waitFor(() => document.querySelector(".settings-modal"));
-    const baseUrl = document.querySelector("#xai-api-base-url");
-    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-    valueSetter?.call(baseUrl, "");
-    baseUrl?.dispatchEvent(new Event("input", { bubbles: true }));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    [...document.querySelectorAll(".settings-modal > footer button")].find((button) =>
-      button.textContent.includes("应用")
-    )?.click();
-    await waitFor(() => !document.querySelector(".settings-modal"));
-    await waitFor(() => document.querySelector(".app")?.dataset.phase === "ready");
-    await waitFor(() => !document.querySelector('button[aria-label="打开设置"]')?.disabled);
-    document.querySelector('button[aria-label="打开设置"]')?.click();
-    await waitFor(() => document.querySelector(".native-auth-summary"));
-    const card = document.querySelector(".native-auth-summary");
-    const permissionOptions = [...document.querySelectorAll(".permission-mode-settings [data-permission-option], .permission-mode-settings > button")];
-    return {
-      methods: [...card.querySelectorAll("li")].map((item) => item.textContent),
-      buttonText: card.querySelector("button")?.textContent ?? "",
-      buttonDisabled: card.querySelector("button")?.disabled ?? true,
-      savedBaseUrl: document.querySelector("#xai-api-base-url")?.value ?? "missing",
-      bodyContainsAuthenticateButton: document.body.innerText.includes("authenticate"),
-      permissionOptions: permissionOptions.map((button) => button.textContent.trim()),
-      selectedPermission: permissionOptions.find((button) => button.getAttribute("aria-checked") === "true")?.textContent.trim() ?? "",
-    };
-  })()`);
-
-  assert.equal(nativeAuth.savedBaseUrl, "");
-  assert.equal(nativeAuth.buttonText, "打开原始终端");
-  assert.equal(nativeAuth.buttonDisabled, false);
-  assert.equal(nativeAuth.bodyContainsAuthenticateButton, false);
-  assert.equal(nativeAuth.methods.some((method) => method.includes("API Key")), true);
-  assert.equal(nativeAuth.methods.some((method) => method.includes("Grok 登录")), true);
-  assert.equal(nativeAuth.permissionOptions.length, 3);
-  assert.match(nativeAuth.permissionOptions[0], /逐项授权/u);
-  assert.match(nativeAuth.permissionOptions[1], /自动/u);
-  assert.match(nativeAuth.permissionOptions[2], /完全授权/u);
-  assert.match(nativeAuth.selectedPermission, /自动/u);
-  await cdp.captureScreenshot(AUTH_SCREENSHOT);
-
   const permissionControl = await cdp.evaluate(`(async () => {
     const waitFor = async (predicate, timeout = 20000) => {
       const started = Date.now();
@@ -269,6 +323,32 @@ try {
   assert.equal(permissionControl.phase, "ready");
   await cdp.captureScreenshot(PERMISSION_CONTROL_SCREENSHOT);
 
+  const permissionReconnect = await cdp.evaluate(`(async () => {
+    const waitFor = async (predicate, timeout = 35000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) throw new Error("Timed out preserving the model across permission reconnect");
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+    };
+    document.querySelector('[data-permission-option="default"]')?.click();
+    await waitFor(() => document.querySelector(".app")?.dataset.phase === "ready" &&
+      document.querySelector(".permission-mode-control")?.dataset.mode === "default");
+    const modelAfterDefault = document.querySelector('.composer-model-select select')?.value ?? "";
+    document.querySelector(".permission-mode-control__trigger")?.click();
+    await waitFor(() => document.querySelector(".permission-mode-menu"));
+    document.querySelector('[data-permission-option="auto"]')?.click();
+    await waitFor(() => document.querySelector(".app")?.dataset.phase === "ready" &&
+      document.querySelector(".permission-mode-control")?.dataset.mode === "auto");
+    return {
+      modelAfterDefault,
+      modelAfterAuto: document.querySelector('.composer-model-select select')?.value ?? "",
+    };
+  })()`);
+
+  assert.equal(permissionReconnect.modelAfterDefault, "smoke-model-b");
+  assert.equal(permissionReconnect.modelAfterAuto, "smoke-model-b");
+
   const permissionDangerGuard = await cdp.evaluate(`(async () => {
     const waitFor = async (predicate, timeout = 10000) => {
       const started = Date.now();
@@ -277,6 +357,8 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     };
+    document.querySelector(".permission-mode-control__trigger")?.click();
+    await waitFor(() => document.querySelector(".permission-mode-menu"));
     document.querySelector('[data-permission-option="always_approve"]')?.click();
     await waitFor(() => document.querySelector(".permission-mode-confirm"));
     const modeBeforeConfirmation = document.querySelector(".permission-mode-control")?.dataset.mode ?? "";
@@ -389,9 +471,7 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 75));
       }
     };
-    document.querySelector('button[aria-label="打开设置"]')?.click();
-    await waitFor(() => document.querySelector(".native-auth-summary button"));
-    document.querySelector(".native-auth-summary button")?.click();
+    document.querySelector('button[aria-label="打开原始终端"]')?.click();
     await waitFor(() => document.querySelector(".terminal-panel"));
     return {
       settingsClosed: !document.querySelector(".settings-modal"),
@@ -411,13 +491,14 @@ try {
     grokPath: GROK_PATH,
     workspacePath: TEST_WORKSPACE,
     historyRecovery,
-    nativeAuth,
+    connectionSetup,
     permissionVisual,
     permissionNarrow,
     permissionControl,
+    permissionReconnect,
     permissionDangerGuard,
     terminal,
-    screenshots: [HISTORY_SCREENSHOT, AUTH_SCREENSHOT, PERMISSION_CONTROL_SCREENSHOT, PERMISSION_SCREENSHOT, PERMISSION_NARROW_SCREENSHOT],
+    screenshots: [HISTORY_SCREENSHOT, CONNECTION_SCREENSHOT, PERMISSION_CONTROL_SCREENSHOT, PERMISSION_SCREENSHOT, PERMISSION_NARROW_SCREENSHOT],
   }, null, 2));
 } finally {
   if (cdp) {
@@ -433,6 +514,7 @@ try {
     await terminateProcessTree(appProcess.pid);
     await waitForProcessExit(appProcess, 5_000);
   }
+  await mockApi.close();
   if (passed && !KEEP_USER_DATA) {
     assertSafeTemporaryUserDataPath(userDataPath);
     await rm(userDataPath, { recursive: true, force: true });
@@ -444,14 +526,58 @@ try {
 }
 }
 
-async function writeSmokeSettings(userDataDirectory) {
+async function startMockApi() {
+  let authorizedModelRequestCount = 0;
+  const server = createServer((request, response) => {
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method !== "GET" || !/^\/v1\/models\/?$/u.test(requestUrl.pathname)) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Not found" } }));
+      return;
+    }
+    const authorized = request.headers.authorization === `Bearer ${SMOKE_API_KEY}` ||
+      request.headers["x-api-key"] === SMOKE_API_KEY;
+    if (!authorized) {
+      response.writeHead(401, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Unauthorized" } }));
+      return;
+    }
+    authorizedModelRequestCount += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      object: "list",
+      data: [
+        { id: "smoke-model-a", object: "model", created: 1, owned_by: "smoke" },
+        { id: "smoke-model-b", object: "model", created: 1, owned_by: "smoke" },
+      ],
+    }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("Smoke API did not bind to a TCP port.");
+  }
+  const rootBaseUrl = `http://127.0.0.1:${address.port}/`;
+  return {
+    rootBaseUrl,
+    versionedBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+    getAuthorizedModelRequestCount: () => authorizedModelRequestCount,
+    close: () => new Promise((resolve, reject) => server.close((error) =>
+      error ? reject(error) : resolve()
+    )),
+  };
+}
+
+async function writeSmokeSettings(userDataDirectory, xaiApiBaseUrl) {
   const now = new Date();
   const createdAt = new Date(now.getTime() - 60_000).toISOString();
   await writeFile(path.join(userDataDirectory, "settings.json"), `${JSON.stringify({
     schemaVersion: 1,
     settings: {
       grokExecutablePath: GROK_PATH,
-      xaiApiBaseUrl: CUSTOM_BASE_URL,
+      xaiApiBaseUrl,
       permissionMode: "auto",
       lastWorkspacePath: TEST_WORKSPACE,
       recentWorkspaces: [{
@@ -544,7 +670,7 @@ class CdpClient {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Timed out waiting for CDP method ${method}.`));
-      }, 50_000);
+      }, 60_000);
       this.pending.set(id, { resolve, reject, timer });
       this.socket.send(JSON.stringify({ id, method, params }));
     });

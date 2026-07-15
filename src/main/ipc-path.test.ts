@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { identifierSchema, IPC_CHANNELS, pathSchema, permissionModeSchema } from "./ipc";
+import {
+  connectSchema,
+  discoverModelsSchema,
+  identifierSchema,
+  IPC_CHANNELS,
+  pathSchema,
+  permissionModeSchema,
+} from "./ipc";
 
 describe("IPC path boundary", () => {
   it("validates non-empty paths without rewriting significant whitespace", () => {
@@ -29,5 +36,28 @@ describe("permission mode IPC boundary", () => {
     expect(permissionModeSchema.parse("auto")).toBe("auto");
     expect(() => permissionModeSchema.parse("bypassPermissions")).toThrow();
     expect(() => permissionModeSchema.parse("unknown")).toThrow();
+  });
+});
+
+describe("explicit xAI connection IPC boundary", () => {
+  const validConnection = {
+    workspacePath: "D:\\project",
+    xaiApiBaseUrl: "https://gateway.example.com/v1",
+    xaiApiKey: "test-key",
+  };
+
+  it("exposes a dedicated model discovery channel", () => {
+    expect(IPC_CHANNELS.discoverModels).toBe("grok-desktop:discover-models");
+    expect(discoverModelsSchema.parse(validConnection)).toEqual(validConnection);
+  });
+
+  it("rejects connect and discovery calls missing either explicit credential field", () => {
+    const { xaiApiKey: _key, ...withoutKey } = validConnection;
+    const { xaiApiBaseUrl: _url, ...withoutUrl } = validConnection;
+
+    expect(() => connectSchema.parse(withoutKey)).toThrow();
+    expect(() => connectSchema.parse(withoutUrl)).toThrow();
+    expect(() => discoverModelsSchema.parse(withoutKey)).toThrow();
+    expect(() => discoverModelsSchema.parse(withoutUrl)).toThrow();
   });
 });

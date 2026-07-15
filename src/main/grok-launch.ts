@@ -7,6 +7,13 @@ import type { PermissionModePreference } from "../shared/contracts.js";
 const MAX_MODEL_ID_LENGTH = 1_024;
 const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
 const SHORT_SENSITIVE_VALUE_LENGTH = 4;
+const GROK_CONNECTION_ENVIRONMENT_VARIABLES = new Set([
+  "GROK_CODE_XAI_API_KEY",
+  "GROK_MODELS_BASE_URL",
+  "GROK_MODELS_LIST_URL",
+  "GROK_XAI_API_BASE_URL",
+  "XAI_API_KEY",
+]);
 const PROTOCOL_PROPERTY_NAMES = new Set([
   "additionalDirectories",
   "args",
@@ -144,8 +151,8 @@ export interface GrokAgentLaunchOptions {
   modelId: string | null;
   reasoningEffort?: string | null;
   permissionMode: PermissionModePreference;
-  xaiApiBaseUrl: string | null;
-  xaiApiKey?: string;
+  xaiApiBaseUrl: string;
+  xaiApiKey: string;
 }
 
 export interface GrokAgentLaunch {
@@ -157,10 +164,22 @@ export function buildGrokAgentLaunch(
   options: GrokAgentLaunchOptions,
   parentEnv: Readonly<NodeJS.ProcessEnv> = process.env,
 ): GrokAgentLaunch {
-  const xaiApiBaseUrl = normalizeXaiApiBaseUrl(options.xaiApiBaseUrl) ?? null;
+  const xaiApiBaseUrl = normalizeXaiApiBaseUrl(options.xaiApiBaseUrl);
+  if (typeof xaiApiBaseUrl !== "string") {
+    throw new TypeError("An explicit xAI API base URL is required.");
+  }
   const xaiApiKey = normalizeXaiApiKey(options.xaiApiKey);
+  if (xaiApiKey === undefined) {
+    throw new TypeError("An explicit xAI API key is required.");
+  }
   const modelId = normalizeModelId(options.modelId);
   const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort ?? null);
+  assertLaunchControlDoesNotContainCredential(modelId, "modelId", xaiApiKey);
+  assertLaunchControlDoesNotContainCredential(
+    reasoningEffort,
+    "reasoningEffort",
+    xaiApiKey,
+  );
   const permissionMode = normalizePermissionMode(options.permissionMode);
   const args = [
     "--permission-mode",
@@ -179,27 +198,25 @@ export function buildGrokAgentLaunch(
   if (reasoningEffort) {
     args.push(`--reasoning-effort=${reasoningEffort}`);
   }
-  if (xaiApiBaseUrl) {
-    args.push("--xai-api-base-url", xaiApiBaseUrl);
-  }
+  args.push("--xai-api-base-url", xaiApiBaseUrl);
   if (permissionMode === "always_approve") {
     args.push("--always-approve");
   }
   args.push("stdio");
 
   const env: NodeJS.ProcessEnv = { ...parentEnv };
-  if (xaiApiKey !== undefined) {
-    // Grok accepts this legacy alias as a fallback. Remove it when the user
-    // explicitly supplies a key so an inherited value cannot win through an
-    // implementation-specific precedence rule.
-    delete env.GROK_CODE_XAI_API_KEY;
-    env.XAI_API_KEY = xaiApiKey;
-  } else if (xaiApiBaseUrl !== null) {
-    // A custom endpoint must not receive credentials inherited from the
-    // desktop process unless the user explicitly supplied a key for it.
-    delete env.XAI_API_KEY;
-    delete env.GROK_CODE_XAI_API_KEY;
+  // Grok accepts this legacy alias as a fallback. Always remove it and replace
+  // XAI_API_KEY with the explicit in-memory credential for this connection.
+  // Grok's model manager reads GROK_MODELS_BASE_URL separately from the
+  // --xai-api-base-url agent option, so bind both paths to the same explicit
+  // endpoint and discard any inherited list override.
+  for (const name of Object.keys(env)) {
+    if (GROK_CONNECTION_ENVIRONMENT_VARIABLES.has(name.toUpperCase())) {
+      delete env[name];
+    }
   }
+  env.GROK_MODELS_BASE_URL = xaiApiBaseUrl;
+  env.XAI_API_KEY = xaiApiKey;
   return { args, env };
 }
 
@@ -242,6 +259,36 @@ function normalizeReasoningEffort(value: string | null): string | null {
     );
   }
   return value.trim();
+}
+
+function assertLaunchControlDoesNotContainCredential(
+  value: string | null,
+  fieldName: string,
+  apiKey: string,
+): void {
+  if (value !== null && containsSensitiveText(value, [apiKey])) {
+    throw new TypeError(`${fieldName} must not contain API credentials.`);
+  }
+}
+
+export function containsSensitiveText(
+  value: string,
+  sensitiveValues: readonly string[],
+): boolean {
+  let candidate = value;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (redactSensitiveText(candidate, sensitiveValues) !== candidate) {
+      return true;
+    }
+    try {
+      const decoded = decodeURIComponent(candidate);
+      if (decoded === candidate) break;
+      candidate = decoded;
+    } catch {
+      break;
+    }
+  }
+  return false;
 }
 
 export function redactSensitiveText(

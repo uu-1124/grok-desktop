@@ -57,11 +57,11 @@ import {
   MAX_PROMPT_CONTEXT_FILES,
 } from "../shared/contracts.js";
 import {
-  normalizeXaiApiBaseUrl,
-  normalizeXaiApiKey,
+  normalizeRequiredXaiConnection,
 } from "../shared/xai-connection.js";
 import {
   buildGrokAgentLaunch,
+  containsSensitiveText,
   redactSensitiveText,
   redactSerializableSecrets,
 } from "./grok-launch.js";
@@ -74,7 +74,7 @@ import {
 import type { PreparedPromptContextFile } from "./workspace-files.js";
 
 const CLIENT_NAME = "Grok Desktop";
-const CLIENT_VERSION = "0.1.1";
+const CLIENT_VERSION = "0.1.3";
 const CONNECT_TIMEOUT_MS = 20_000;
 const SPAWN_TIMEOUT_MS = 5_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
@@ -94,8 +94,8 @@ interface NormalizedConnectRequest {
   modelId: string | null;
   reasoningEffort: string | null;
   permissionMode: PermissionModePreference;
-  xaiApiBaseUrl: string | null;
-  xaiApiKey: string | undefined;
+  xaiApiBaseUrl: string;
+  xaiApiKey: string;
   mcpServers: McpServerConfig[];
 }
 
@@ -126,6 +126,7 @@ interface ActiveCancellation {
 export interface GrokRuntimeOptions {
   permissionTimeoutMs?: number;
   cancelTimeoutMs?: number;
+  connectTimeoutMs?: number;
   now?: () => Date;
   createId?: () => string;
 }
@@ -140,6 +141,7 @@ export class GrokRuntime {
   private readonly emit: (event: DesktopEvent) => void;
   private readonly permissionTimeoutMs: number;
   private readonly cancelTimeoutMs: number;
+  private readonly connectTimeoutMs: number;
   private readonly now: () => Date;
   private readonly createId: () => string;
 
@@ -149,6 +151,7 @@ export class GrokRuntime {
   private agent: ClientContext | null = null;
   private stderrTail = "";
   private sensitiveValues: string[] = [];
+  private xaiApiKey: string | null = null;
   private xaiApiKeyConfigured = false;
   private mcpServers: McpServerConfig[] = [];
   /** Names only; values from the Grok launch environment are never duplicated here. */
@@ -183,6 +186,10 @@ export class GrokRuntime {
     this.cancelTimeoutMs = requirePositiveTimeout(
       options.cancelTimeoutMs ?? DEFAULT_CANCEL_CONFIRM_TIMEOUT_MS,
       "cancelTimeoutMs",
+    );
+    this.connectTimeoutMs = requirePositiveTimeout(
+      options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS,
+      "connectTimeoutMs",
     );
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
@@ -226,6 +233,20 @@ export class GrokRuntime {
   }
 
   async connect(request: ConnectRequest): Promise<RuntimeSnapshot> {
+    return this.connectInternal(request);
+  }
+
+  async connectWithAdvertisedModels(
+    request: ConnectRequest,
+    advertisedModels: readonly ModelInfo[],
+  ): Promise<RuntimeSnapshot> {
+    return this.connectInternal(request, advertisedModels);
+  }
+
+  private async connectInternal(
+    request: ConnectRequest,
+    advertisedModels?: readonly ModelInfo[],
+  ): Promise<RuntimeSnapshot> {
     if (this.connectInProgress) {
       throw new Error("A Grok connection attempt is already in progress.");
     }
@@ -240,16 +261,23 @@ export class GrokRuntime {
       if (requestGeneration !== this.lifecycleGeneration) {
         throw new Error("The Grok connection attempt was cancelled.");
       }
+      const selectionSnapshot = advertisedModels
+        ? {
+            ...this.snapshot,
+            executablePath: normalized.executablePath,
+            availableModels: advertisedModels.map(cloneModelInfo),
+          }
+        : this.snapshot;
       assertAdvertisedModelSelection(
         normalized.modelId,
         normalized.executablePath,
-        this.snapshot,
+        selectionSnapshot,
       );
       assertAdvertisedReasoningEffort(
         normalized.reasoningEffort,
         normalized.modelId,
         normalized.executablePath,
-        this.snapshot,
+        selectionSnapshot,
       );
 
       if (this.hasActiveWork) {
@@ -262,6 +290,7 @@ export class GrokRuntime {
       generation = ++this.lifecycleGeneration;
       this.stderrTail = "";
       this.xaiApiKeyConfigured = normalized.xaiApiKey !== undefined;
+      this.xaiApiKey = normalized.xaiApiKey;
       this.sensitiveValues = collectSensitiveValues(
         normalized.xaiApiKey,
         process.env.XAI_API_KEY,
@@ -360,13 +389,17 @@ export class GrokRuntime {
             version: CLIENT_VERSION,
           },
         }),
-        CONNECT_TIMEOUT_MS,
+        this.connectTimeoutMs,
         "Timed out while initializing the Grok ACP connection.",
       );
 
       this.assertCurrentGeneration(generation);
       assertSupportedProtocol(initialization.protocolVersion);
       const initializationState = parseInitialization(initialization, normalized.modelId);
+      assertModelMetadataDoesNotContainCredentials(
+        initializationState,
+        normalized.xaiApiKey,
+      );
       assertMcpTransportsAdvertised(
         normalized.mcpServers,
         initializationState.capabilities.mcp,
@@ -448,6 +481,7 @@ export class GrokRuntime {
         cwd: workspacePath,
         mcpServers,
       });
+      this.applySessionCapabilities(response);
       const session = createSessionState(
         response.sessionId,
         titleFromResponse(response) ?? normalizedTitle,
@@ -456,7 +490,6 @@ export class GrokRuntime {
       );
       this.sessions.set(session.sessionId, session);
       this.ensureExecution(session.sessionId);
-      this.applySessionCapabilities(response);
       this.refreshOperationalPhase();
 
       const payload = redactSerializableSecrets(
@@ -511,6 +544,7 @@ export class GrokRuntime {
         cwd: workspacePath,
         mcpServers,
       });
+      this.applySessionCapabilities(response);
       const latest = this.sessions.get(normalizedSessionId) ?? provisional;
       const responseTitle = titleFromResponse(response);
       const session = mergeSessionState(
@@ -521,7 +555,6 @@ export class GrokRuntime {
       );
       this.sessions.set(normalizedSessionId, session);
       this.ensureExecution(normalizedSessionId);
-      this.applySessionCapabilities(response);
       this.refreshOperationalPhase();
 
       const payload = redactSerializableSecrets(
@@ -815,8 +848,8 @@ export class GrokRuntime {
         request,
       );
       const capabilities = parseSessionCapabilities(response);
-      session.configOptions = capabilities.configOptions;
       this.applyParsedSessionCapabilities(capabilities);
+      session.configOptions = capabilities.configOptions;
       this.emitSyntheticSessionUpdate(normalizedSessionId, {
         sessionUpdate: "config_option_update",
         configOptions: cloneSerializable(session.configOptions),
@@ -929,10 +962,10 @@ export class GrokRuntime {
       }
     } else if (update.sessionUpdate === "config_option_update") {
       const capabilities = parseSessionCapabilities(update);
+      this.applyParsedSessionCapabilities(capabilities);
       if (session) {
         session.configOptions = capabilities.configOptions;
       }
-      this.applyParsedSessionCapabilities(capabilities);
       rendererUpdate = {
         sessionUpdate: "config_option_update",
         configOptions: cloneSerializable(capabilities.configOptions),
@@ -1183,6 +1216,9 @@ export class GrokRuntime {
   private applyParsedSessionCapabilities(
     state: ReturnType<typeof parseSessionCapabilities>,
   ): void {
+    if (this.xaiApiKey) {
+      assertModelMetadataDoesNotContainCredentials(state, this.xaiApiKey);
+    }
     if (!state.currentModelId && state.availableModels.length === 0) {
       return;
     }
@@ -1341,6 +1377,7 @@ export class GrokRuntime {
       this.emitEvent({ type: "notice", level: "error", message });
     } finally {
       this.sensitiveValues = [];
+      this.xaiApiKey = null;
     }
   }
 
@@ -1351,6 +1388,7 @@ export class GrokRuntime {
     this.connection = null;
     this.agent = null;
     this.xaiApiKeyConfigured = false;
+    this.xaiApiKey = null;
     this.mcpServers = [];
     this.mcpInheritedEnvironment = {};
     this.sessions.clear();
@@ -1386,6 +1424,7 @@ export class GrokRuntime {
     } finally {
       this.stderrTail = "";
       this.sensitiveValues = [];
+      this.xaiApiKey = null;
     }
   }
 
@@ -1667,8 +1706,10 @@ async function normalizeConnectRequest(request: ConnectRequest): Promise<Normali
   const permissionMode = request.permissionMode === undefined
     ? request.alwaysApprove ? "always_approve" : "default"
     : requirePermissionMode(request.permissionMode);
-  const xaiApiBaseUrl = normalizeXaiApiBaseUrl(request.xaiApiBaseUrl) ?? null;
-  const xaiApiKey = normalizeXaiApiKey(request.xaiApiKey);
+  const { xaiApiBaseUrl, xaiApiKey } = normalizeRequiredXaiConnection(
+    request.xaiApiBaseUrl,
+    request.xaiApiKey,
+  );
   const mcpServers = await canonicalizeMcpServerExecutables(
     normalizeMcpServers(request.mcpServers),
   );
@@ -1921,6 +1962,44 @@ function assertSupportedProtocol(protocolVersion: number): void {
     throw new Error(
       `Unsupported ACP protocol version ${protocolVersion}; this client supports ${PROTOCOL_VERSION}.`,
     );
+  }
+}
+
+function assertModelMetadataDoesNotContainCredentials(
+  state: {
+    currentModelId: string | null;
+    availableModels: readonly ModelInfo[];
+    configOptions?: readonly SessionConfigOption[];
+  },
+  apiKey: string,
+): void {
+  const values: Array<string | null | undefined> = [state.currentModelId];
+  for (const model of state.availableModels) {
+    values.push(
+      model.id,
+      model.name,
+      model.description,
+      model.reasoningEffort,
+    );
+    for (const effort of model.reasoningEfforts ?? []) {
+      values.push(effort.id, effort.name, effort.description);
+    }
+  }
+  for (const option of state.configOptions ?? []) {
+    if (option.category !== "model") continue;
+    values.push(
+      option.id,
+      option.name,
+      option.description,
+      typeof option.currentValue === "string" ? option.currentValue : undefined,
+    );
+    for (const candidate of option.options ?? []) {
+      values.push(candidate.value, candidate.name, candidate.description);
+    }
+  }
+  if (values.some((value) =>
+    typeof value === "string" && containsSensitiveText(value, [apiKey]))) {
+    throw new Error("Grok ACP returned model metadata containing API credentials.");
   }
 }
 

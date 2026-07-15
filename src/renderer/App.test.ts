@@ -6,7 +6,7 @@ import {
   isFileToolKind,
   toolKindLabel,
   getActiveModelLabel,
-  getAuthMethodPresentations,
+  getActiveModelControl,
   getConversationAlerts,
   grokConnectionErrorMessage,
   getXaiConnectionBadge,
@@ -22,6 +22,7 @@ import {
   mcpSettingsError,
   mergeContextFiles,
   redactSensitiveText,
+  reconnectModelSelection,
   reportedMcpServerCountLabel,
   requiresXaiApiKeyReentry,
   sessionLoadFailureDetail,
@@ -34,13 +35,14 @@ import {
   runtimeMcpStatusAppliesToWorkspace,
   sessionSearchEscapeAction,
   settingsDisconnectControl,
+  selectEnabledModels,
   shouldGroupStoredSessions,
   shouldOfferSessionSearch,
   moveCommandSelection,
-  shouldAutoConnectWorkspace,
   transitionXaiApiKeyForBaseUrl,
   turnOutcomePresentation,
   validateXaiApiBaseUrl,
+  validateXaiConnectionPair,
   xaiApiBaseUrlAdvisory,
   xaiApiKeyHelpText,
 } from "./App";
@@ -52,8 +54,8 @@ import type { RuntimeSnapshot, StoredSession } from "../shared/contracts";
 import { createEmptySessionView } from "./lib/acp";
 
 describe("xAI connection settings", () => {
-  it("accepts empty, secure remote, and explicit local development URLs", () => {
-    expect(validateXaiApiBaseUrl("")).toBeNull();
+  it("requires a URL and accepts secure remote or explicit local development URLs", () => {
+    expect(validateXaiApiBaseUrl("")).toContain("Base URL 必填");
     expect(validateXaiApiBaseUrl("https://api.x.ai/v1")).toBeNull();
     expect(validateXaiApiBaseUrl("http://localhost:8080/v1")).toBeNull();
     expect(validateXaiApiBaseUrl("http://localhost.:8080/v1")).toBeNull();
@@ -86,9 +88,14 @@ describe("xAI connection settings", () => {
   });
 
   it("explains the credential source difference between default and custom endpoints", () => {
-    expect(xaiApiKeyHelpText(" ")).toContain("原生登录或继承凭据");
-    expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("不会继承");
-    expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("明确输入");
+    expect(xaiApiKeyHelpText(" ")).toContain("URL 与 Key 必须同时提供");
+    expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("不会写入设置");
+  });
+
+  it("requires an explicit URL and API key before discovery or connection", () => {
+    expect(validateXaiConnectionPair("", "test-key")).toContain("Base URL 必填");
+    expect(validateXaiConnectionPair("https://gateway.example.com/v1", "")).toContain("API Key 必填");
+    expect(validateXaiConnectionPair("https://gateway.example.com/v1", "test-key")).toBeNull();
   });
 
   it("advises remote root endpoints without rewriting valid custom URLs", () => {
@@ -113,33 +120,15 @@ describe("xAI connection settings", () => {
     expect(message).not.toContain("reqwest");
   });
 
-  it("presents only the authentication methods advertised for Grok's default endpoint", () => {
-    const methods = [
-      { id: "xai.api_key", name: "xai.api_key", description: "env" },
-      { id: "grok.com", name: "Grok", description: "Sign in with Grok" },
-      { id: "future.auth", name: "Future auth", description: "Agent managed" },
-    ];
-    expect(getAuthMethodPresentations(methods, "https://gateway.example.com/v1")).toEqual([]);
-    expect(getAuthMethodPresentations(methods, "")).toEqual([
-      {
-        id: "xai.api_key",
-        label: "API Key",
-        detail: "可由 Grok 的环境变量或 config.toml 提供",
-        managedLogin: false,
-      },
-      {
-        id: "grok.com",
-        label: "Grok 登录",
-        detail: "由 Grok 原始终端完成；桌面端不接管登录凭据",
-        managedLogin: true,
-      },
-      {
-        id: "future.auth",
-        label: "Future auth",
-        detail: "Agent managed",
-        managedLogin: false,
-      },
-    ]);
+  it("reports that automatic same-origin candidates were exhausted", () => {
+    const message = grokConnectionErrorMessage(
+      new Error("Unable to resolve the supplied API base URL through Grok ACP after 2 same-origin attempts. Timed out while initializing the Grok ACP connection."),
+      "https://gateway.example.com",
+    );
+
+    expect(message).toContain("自动尝试");
+    expect(message).toContain("URL 与 API Key");
+    expect(message).not.toContain("没有 API 路径");
   });
 
   it("scopes an in-memory API key to the endpoint origin", () => {
@@ -234,7 +223,7 @@ describe("xAI connection settings", () => {
     expect(getXaiConnectionBadge({
       xaiApiBaseUrl: null,
       xaiApiKeyConfigured: true,
-    })?.label).toBe("Grok 默认 · 内存 Key");
+    })).toBeNull();
   });
 });
 
@@ -373,15 +362,6 @@ describe("model reasoning effort settings", () => {
     expect(reasoningEffortsForModel(models, null)).toEqual([]);
     expect(reasoningEffortsForModel(models, "unknown")).toEqual([]);
     expect(preferredReasoningEffort(models, "grok-build")).toBe("high");
-  });
-});
-
-describe("connection restore", () => {
-  it("auto-connects only default and loopback endpoints without a persisted key", () => {
-    expect(shouldAutoConnectWorkspace("")).toBe(true);
-    expect(shouldAutoConnectWorkspace("http://localhost:8080/v1")).toBe(true);
-    expect(shouldAutoConnectWorkspace("https://127.0.0.1:8443/v1")).toBe(true);
-    expect(shouldAutoConnectWorkspace("https://gateway.example.com/v1")).toBe(false);
   });
 });
 
@@ -769,6 +749,95 @@ describe("active session model presentation", () => {
 
   it("falls back to the advertised runtime model name", () => {
     expect(getActiveModelLabel(undefined, runtime)).toBe("Runtime model");
+  });
+
+  it("keeps multiple enabled models in the provider catalog order", () => {
+    const models = [
+      { id: "model-a", name: "Model A" },
+      { id: "model-b", name: "Model B" },
+      { id: "model-c", name: "Model C" },
+    ];
+
+    expect(selectEnabledModels(models, ["model-c", "model-a", "model-a"])).toEqual([
+      { id: "model-a", name: "Model A" },
+      { id: "model-c", name: "Model C" },
+    ]);
+  });
+
+  it("preserves the enabled process model and its matching reasoning effort on reconnect", () => {
+    expect(reconnectModelSelection(runtime, [{
+      id: "runtime-model",
+      name: "Runtime model",
+      reasoningEfforts: [
+        { id: "low", name: "Low", isDefault: false },
+        { id: "high", name: "High", isDefault: true },
+      ],
+    }], {
+      modelId: "runtime-model",
+      reasoningEffort: "high",
+    })).toEqual({ modelId: "runtime-model", reasoningEffort: "high" });
+  });
+
+  it("does not carry a disabled model or a stale effort into reconnect", () => {
+    expect(reconnectModelSelection(runtime, [
+      { id: "other-model", name: "Other model" },
+    ], {
+      modelId: "runtime-model",
+      reasoningEffort: "high",
+    })).toEqual({});
+
+    expect(reconnectModelSelection({ ...runtime, currentModelId: "session-model" }, [{
+      id: "session-model",
+      name: "Session model",
+      reasoningEfforts: [{ id: "low", name: "Low", isDefault: true }],
+    }], {
+      modelId: "runtime-model",
+      reasoningEffort: "high",
+    })).toEqual({ modelId: "session-model" });
+  });
+
+  it("uses ACP session configuration when the current model is editable", () => {
+    const view = createEmptySessionView();
+    view.configOptions = [{
+      id: "model",
+      name: "Model",
+      type: "select",
+      category: "model",
+      currentValue: "model-b",
+      readOnly: false,
+      options: [
+        { value: "model-a", name: "Model A" },
+        { value: "model-b", name: "Model B" },
+      ],
+    }];
+
+    expect(getActiveModelControl(view, runtime, [
+      { id: "model-a", name: "Model A" },
+      { id: "model-b", name: "Model B" },
+    ])).toMatchObject({
+      currentModelId: "model-b",
+      configId: "model",
+      strategy: "session",
+    });
+  });
+
+  it("falls back to a real process reconnect for read-only model catalogs", () => {
+    const view = createEmptySessionView();
+    view.configOptions = [{
+      id: "model",
+      name: "Model",
+      type: "select",
+      category: "model",
+      currentValue: "runtime-model",
+      readOnly: true,
+      options: [{ value: "runtime-model", name: "Runtime model" }],
+    }];
+
+    expect(getActiveModelControl(view, runtime, runtime.availableModels)).toMatchObject({
+      currentModelId: "runtime-model",
+      configId: null,
+      strategy: "reconnect",
+    });
   });
 });
 

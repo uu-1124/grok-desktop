@@ -3,7 +3,8 @@
 ## 目标
 
 把 Grok CLI 已经提供的编码智能体能力安全地映射为 Windows 桌面工作流，同时保持
-Grok 的升级、配置、身份认证和会话存储边界不变。
+Grok 的升级、配置和会话存储边界不变。桌面结构化连接只接受用户显式提供的兼容 API
+Base URL 与 API Key，不读取或继承 Grok CLI 的身份凭据。
 
 ## 进程与数据流
 
@@ -65,25 +66,38 @@ Electron main process
   当前 TypeScript SDK 未定义该私有通知的参数结构和可靠语义。桌面端目前只暴露能力布尔
   值，不猜测 payload、不启动工作区 watcher；获得 xAI 的明确契约后再通过 SDK 的
   `agent.notify(...)` 接入。
-- 标准 ACP `authenticate` 已审计，但当前 Grok 的 `grok.com` agent-managed 方法进入
-  Agent 自己的交互等待，未给客户端 URL、完成状态或取消契约。设置页只展示 Grok 实际广告
-  的认证方式，并为 `grok.com` 提供原始终端入口；桌面端不调用会导致无界等待的半成品
-  `authenticate`，不接管凭据。API Key 输入仍覆盖自定义 URL 场景。
+- 产品界面不提供 Grok 登录入口，也不调用 ACP `authenticate`。Agent 返回的认证元数据不会
+  被解释为登录 UI 或连接回退；结构化连接缺少 URL 或 Key 时直接拒绝连接。
 - Prompt 文件上下文只接受用户从当前工作区选择的普通文件；主进程使用 canonical path
   再验证工作区边界。Agent 广告 `embeddedContext` 时仅内嵌有界 UTF-8 文本，其他文件
   使用 ACP ResourceLink，不把正文返回 Renderer 或写入设置。
-- 用户可覆盖 API Base URL。远程地址只接受 HTTPS，HTTP 仅接受回环主机；禁止 URL
-  credentials、query 和 fragment。Base URL 是唯一持久化的连接字段，API Key 通过
-  子进程环境副本传给本次独立 Grok Agent，不进入快照、事件或设置。
+- 每次结构化连接必须显式提供 API Base URL 与 API Key。远程地址只接受 HTTPS，HTTP 仅接受
+  回环主机；禁止 URL credentials、query 和 fragment。Base URL 是唯一持久化的连接字段，
+  API Key 通过子进程环境副本传给本次独立 Grok Agent，不进入快照、事件或设置。
+- 地址检测通过短生命周期 Grok ACP Runtime 完成，Renderer 和 Main 不直接请求第三方
+  `/models`。候选始终保持协议、主机、端口和 Origin 不变：根路径依次尝试 `/v1` 与原地址，
+  非版本路径依次尝试原地址与其 `/v1` 子路径，已以版本段结尾的路径只尝试原地址。只有成功
+  完成 ACP 初始化的候选才能返回解析后的 Base URL 和该连接广告的模型。
+- 创建 Grok 子进程时按 Windows 不区分大小写的环境变量语义清除继承的 API Key、旧 Key
+  别名、模型 Base URL 与模型列表覆盖，再通过参数和 `GROK_MODELS_BASE_URL` 把 Agent 与模型
+  管理器绑定到同一个显式端点；用户 Key 只写入该子进程环境副本。
 - Runtime 快照只额外暴露规范化 Base URL 和“当前进程是否显式配置 API Key”的布尔值，
   从不回传 Key 原文。Renderer 重载后若无法恢复内存 Key，会阻止同 Origin 的静默重连并
   要求用户重新输入；切换到其他 Origin 时不会沿用旧凭据。
-- 对话 Composer 只从 Runtime 非敏感快照展示当前自定义 API host 和“内存 Key”存在状态，
-  点击可返回连接设置；它不展示、复制或持久化 Key 原文。默认端点且没有显式 Key 时不增加
-  状态噪声。
+- 对话 Composer 只从 Runtime 非敏感快照展示当前 API host 和“内存 Key”存在状态，点击可
+  返回连接设置；它不展示、复制或持久化 Key 原文。
+- 设置页的模型目录来自当前 URL + Key 成功连接后的 ACP 响应；编辑 URL 或 Key 会使旧目录
+  立即失效。用户可以在进程内启用多个模型并选择初始模型；正式连接前由独立短生命周期
+  Runtime 针对同一 URL + Key 重新验证选择，验证失败不会触碰当前长期 Runtime。Composer
+  切换模型时，若 Agent 提供可写会话模型配置则调用 `session/set_config_option`；只读或进程级
+  模型通过带 `--model=<id>` 的独立 Agent 重连生效。权限切换、终端返回与普通重连会继续携带
+  当前仍启用的模型及其匹配思考强度。
+- ACP 广告的模型 ID、名称、描述与思考强度在进入 Runtime 快照或进程参数前检查凭据反射；
+  任何包含本次 API Key 原文、JSON 转义或 URL 编码变体的控制值都会使连接安全失败。
 - `modelState.availableModels[*]._meta.reasoningEfforts` 仅在 Grok 明确广告时才被归一化为
-  Renderer DTO。选择值必须同时属于同一 `grok.exe`、同一广告模型，且通过绑定的
-  `--reasoning-effort=<value>` 参数启动；不保存值，也不接受任意自定义档位。
+  Renderer DTO。选择值必须同时属于同一 `grok.exe` 和同一广告模型，并通过绑定的
+  `--reasoning-effort=<value>` 参数启动；模型目录、启用选择与思考强度均不写入设置，也不接受
+  任意自定义值。
 - MCP 配置只接受 Grok 在 `initialize` 中显式广告的 HTTP/SSE/stdio 传输。Main 在初始化
   后做权威 capability gate，再把内存态配置的独立副本传给 `session/new` 和
   `session/load`；未广告的传输与 MCP-over-ACP 不进入产品接口。
@@ -151,6 +165,7 @@ Electron main process
 桌面端设置与最近列表写入 Electron `userData`。以下数据不进入桌面端存储：
 
 - API Key、Token、认证码
+- ACP 模型目录、模型启用选择与思考强度
 - MCP 服务器名称、URL、Header、stdio 命令、参数与环境变量
 - Grok 配置文件内容
 - 完整会话消息或工具结果
@@ -164,5 +179,7 @@ Electron main process
 - 忽略未知通知，保留原始终端入口。
 - Grok 可执行文件每次连接前重新验证；路径失效时回到发现流程。
 - 打包应用的 Electron smoke harness 只启动 `release/win-unpacked` 中的桌面端，并使用系统
-  临时目录下的隔离 `userData`。它不发送 Prompt、不调用登录、不读取用户真实设置；CDP 端口
-  由 Chromium 动态分配，完成后先关闭窗口，超时才按根 PID 清理测试进程树。
+  临时目录下的隔离 `userData`、运行时随机 Key 与随机回环 Mock API。它验证根地址到 `/v1`
+  的同源匹配、ACP 多模型和 Composer 选择，不发送 Prompt、不访问真实服务商、不提供登录
+  入口，也不读取用户真实设置；CDP 端口由 Chromium 动态分配，完成后先关闭窗口，超时才按
+  根 PID 清理测试进程树。

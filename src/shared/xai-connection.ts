@@ -66,10 +66,58 @@ export function normalizeXaiApiKey(value: unknown): string | undefined {
   return normalized;
 }
 
+export function normalizeRequiredXaiConnection(
+  baseUrl: unknown,
+  apiKey: unknown,
+): { xaiApiBaseUrl: string; xaiApiKey: string } {
+  if (typeof baseUrl !== "string" || !baseUrl.trim()) {
+    throw new TypeError("An explicit xAI API base URL is required.");
+  }
+  if (typeof apiKey !== "string" || !apiKey.trim()) {
+    throw new TypeError("An explicit xAI API key is required.");
+  }
+
+  const xaiApiBaseUrl = normalizeXaiApiBaseUrl(baseUrl);
+  const xaiApiKey = normalizeXaiApiKey(apiKey);
+  if (typeof xaiApiBaseUrl !== "string") {
+    throw new TypeError("An explicit xAI API base URL is required.");
+  }
+  if (typeof xaiApiKey !== "string") {
+    throw new TypeError("An explicit xAI API key is required.");
+  }
+  return { xaiApiBaseUrl, xaiApiKey };
+}
+
 export function isLoopbackXaiApiBaseUrl(value: unknown): boolean {
   const normalized = normalizeXaiApiBaseUrl(value);
   return typeof normalized === "string" &&
     isLoopbackHostname(new URL(normalized).hostname);
+}
+
+export function xaiApiBaseUrlCandidates(value: unknown): string[] {
+  const normalized = normalizeXaiApiBaseUrl(value);
+  if (typeof normalized !== "string") {
+    throw new TypeError("xaiApiBaseUrl is required for endpoint discovery.");
+  }
+
+  const parsed = new URL(normalized);
+  const trimmedPath = parsed.pathname.replace(/\/+$/u, "") || "/";
+  const exact = new URL(parsed.toString());
+  exact.pathname = trimmedPath;
+  const exactValue = exact.toString();
+
+  if (trimmedPath === "/") {
+    const conventional = new URL(parsed.toString());
+    conventional.pathname = "/v1";
+    return [conventional.toString(), exactValue];
+  }
+  if (/\/v\d+(?:\.\d+)?$/iu.test(trimmedPath)) {
+    return [exactValue];
+  }
+
+  const conventional = new URL(parsed.toString());
+  conventional.pathname = `${trimmedPath}/v1`;
+  return [exactValue, conventional.toString()];
 }
 
 function hasAuthorityUserInfo(value: string): boolean {

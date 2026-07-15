@@ -1,6 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
-  AuthMethodInfo,
   BootstrapPayload,
   AvailableCommand,
   ContextFileReference,
@@ -56,6 +55,7 @@ import {
   MAX_XAI_API_KEY_LENGTH,
   isLoopbackXaiApiBaseUrl,
   normalizeXaiApiBaseUrl as normalizeSharedXaiApiBaseUrl,
+  normalizeXaiApiKey as normalizeSharedXaiApiKey,
 } from "../shared/xai-connection";
 import {
   addLocalPrompt,
@@ -135,6 +135,7 @@ const TerminalPanel = lazy(async () => {
 type InspectorTab = "activity" | "plan" | "changes" | "config";
 type MainView = "conversation" | "terminal";
 type NoticeLevel = "info" | "warning" | "error";
+type ModelDiscoveryPhase = "idle" | "loading" | "ready" | "error";
 
 interface NoticeState {
   id: number;
@@ -179,6 +180,8 @@ let mcpEditorSequence = 0;
 interface ConnectionSettingsDraft {
   baseUrl: string;
   apiKey: string;
+  models: ModelInfo[];
+  enabledModelIds: string[];
   permissionMode: PermissionModePreference;
   modelId: string | null;
   reasoningEffort: string | null;
@@ -347,9 +350,12 @@ export function preferredReasoningEffort(
   return advertised.find((effort) => effort.isDefault)?.id ?? "";
 }
 
-function normalizeXaiApiBaseUrl(value: string): string | null {
+function normalizeXaiApiBaseUrl(value: string): string {
   const normalized = value.trim();
-  return normalized ? normalizeSharedXaiApiBaseUrl(normalized) ?? null : null;
+  if (!normalized) throw new TypeError("API Base URL 必填");
+  const baseUrl = normalizeSharedXaiApiBaseUrl(normalized);
+  if (typeof baseUrl !== "string") throw new TypeError("API Base URL 必填");
+  return baseUrl;
 }
 
 function normalizeXaiApiKey(value: string): string {
@@ -358,7 +364,7 @@ function normalizeXaiApiKey(value: string): string {
 
 export function validateXaiApiBaseUrl(value: string): string | null {
   const normalized = value.trim();
-  if (!normalized) return null;
+  if (!normalized) return "API Base URL 必填";
   if (value.length > MAX_XAI_API_BASE_URL_LENGTH) {
     return `URL 不能超过 ${MAX_XAI_API_BASE_URL_LENGTH.toLocaleString()} 个字符`;
   }
@@ -375,7 +381,7 @@ export function validateXaiApiBaseUrl(value: string): string | null {
   try {
     parsed = new URL(normalized);
   } catch {
-    return "请输入完整 URL，例如 https://api.x.ai/v1";
+    return "请输入完整 URL，例如 https://provider.example/v1";
   }
 
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
@@ -394,6 +400,18 @@ export function validateXaiApiBaseUrl(value: string): string | null {
   return "URL 不符合安全连接规则";
 }
 
+export function validateXaiConnectionPair(baseUrl: string, apiKey: string): string | null {
+  const baseUrlError = validateXaiApiBaseUrl(baseUrl);
+  if (baseUrlError) return baseUrlError;
+  if (!apiKey.trim()) return "API Key 必填";
+  try {
+    normalizeSharedXaiApiKey(apiKey);
+    return null;
+  } catch {
+    return `API Key 必须是有效的非空字符串，且不能超过 ${MAX_XAI_API_KEY_LENGTH.toLocaleString()} 个字符`;
+  }
+}
+
 export function xaiApiBaseUrlAdvisory(value: string): string | null {
   const normalized = value.trim();
   if (!normalized) return null;
@@ -406,7 +424,7 @@ export function xaiApiBaseUrlAdvisory(value: string): string | null {
     return null;
   }
 
-  return "当前地址没有 API 路径。OpenAI/xAI 兼容网关通常需要以 /v1 结尾，请按服务商文档确认。";
+  return "当前地址没有 API 路径；检测时会优先尝试同 Origin 的 /v1，再验证原地址。";
 }
 
 export function grokConnectionErrorMessage(error: unknown, baseUrl: string): string {
@@ -418,6 +436,9 @@ export function grokConnectionErrorMessage(error: unknown, baseUrl: string): str
   const advisory = xaiApiBaseUrlAdvisory(baseUrl);
   const returnedNonJson = /(?:kind:\s*Decode|expected value[^\n]*line:\s*1[^\n]*column:\s*1)/iu.test(raw);
 
+  if (/Unable to resolve the supplied API base URL through Grok ACP/iu.test(raw)) {
+    return "无法连接 Grok：已自动尝试用户地址及同 Origin 的兼容 API 路径，但均未通过 ACP 初始化。请核对 URL 与 API Key，并确认服务商支持 OpenAI/xAI 兼容接口。";
+  }
   if (returnedNonJson) {
     return advisory
       ? `无法连接 Grok：API Base URL 返回了网页或其他非 JSON 响应。${advisory}`
@@ -452,47 +473,8 @@ export function sessionLoadFailureDetail(error: unknown, secret: string): string
 }
 
 export function xaiApiKeyHelpText(baseUrl: string): string {
-  return baseUrl.trim()
-    ? "自定义 URL 不会继承桌面进程中的 XAI_API_KEY；需要 Key 时请在此明确输入。Key 仅保存在当前桌面进程并传给该地址的 Grok 连接，不会写入设置。"
-    : "留空时由 Grok 使用其原生登录或继承凭据；显式输入的 Key 仅保存在当前桌面进程并传给后续 Grok 连接，不会写入设置。";
-}
-
-export interface AuthMethodPresentation {
-  id: string;
-  label: string;
-  detail: string;
-  managedLogin: boolean;
-}
-
-export function getAuthMethodPresentations(
-  authMethods: readonly AuthMethodInfo[],
-  baseUrl: string,
-): AuthMethodPresentation[] {
-  if (baseUrl.trim()) return [];
-  return authMethods.map((method) => {
-    if (method.id === "xai.api_key") {
-      return {
-        id: method.id,
-        label: "API Key",
-        detail: "可由 Grok 的环境变量或 config.toml 提供",
-        managedLogin: false,
-      };
-    }
-    if (method.id === "grok.com") {
-      return {
-        id: method.id,
-        label: "Grok 登录",
-        detail: "由 Grok 原始终端完成；桌面端不接管登录凭据",
-        managedLogin: true,
-      };
-    }
-    return {
-      id: method.id,
-      label: method.name || method.id,
-      detail: method.description?.trim() || "由当前 Grok 运行时提供",
-      managedLogin: false,
-    };
-  });
+  void baseUrl;
+  return "URL 与 Key 必须同时提供。Key 仅保存在当前桌面进程并传给本次 Grok 连接，不会写入设置。";
 }
 
 export function getXaiApiCredentialScope(
@@ -568,28 +550,22 @@ export function getXaiConnectionBadge(
   runtime: Pick<RuntimeSnapshot, "xaiApiBaseUrl" | "xaiApiKeyConfigured">,
 ): XaiConnectionBadge | null {
   const endpoint = runtime.xaiApiBaseUrl?.trim() || null;
-  if (!endpoint && !runtime.xaiApiKeyConfigured) return null;
+  if (!endpoint) return null;
 
-  let endpointLabel = "Grok 默认";
-  if (endpoint) {
-    try {
-      endpointLabel = new URL(endpoint).host;
-    } catch {
-      endpointLabel = "自定义 API";
-    }
+  let endpointLabel: string;
+  try {
+    endpointLabel = new URL(endpoint).host;
+  } catch {
+    endpointLabel = "自定义 API";
   }
   const keyNotice = runtime.xaiApiKeyConfigured
     ? "；API Key 仅保存在当前桌面进程"
     : "";
   return {
     label: `${endpointLabel}${runtime.xaiApiKeyConfigured ? " · 内存 Key" : ""}`,
-    title: `当前 API：${endpoint ?? "Grok 默认端点"}${keyNotice}。点击打开连接设置。`,
+    title: `当前 API：${endpoint}${keyNotice}。点击打开连接设置。`,
     keyConfigured: runtime.xaiApiKeyConfigured,
   };
-}
-
-export function shouldAutoConnectWorkspace(baseUrl: string): boolean {
-  return !baseUrl.trim() || isLoopbackXaiApiBaseUrl(baseUrl);
 }
 
 export function resolveRequestedPermissionMode(
@@ -989,6 +965,86 @@ export function getActiveModelLabel(
   return runtimeModel?.name || runtime.currentModelId || runtime.grokVersion || "Grok";
 }
 
+export function selectEnabledModels(
+  models: readonly ModelInfo[],
+  enabledModelIds: readonly string[],
+): ModelInfo[] {
+  const enabled = new Set(enabledModelIds);
+  const seen = new Set<string>();
+  return models.filter((model) => {
+    if (!enabled.has(model.id) || seen.has(model.id)) return false;
+    seen.add(model.id);
+    return true;
+  }).map((model) => ({
+    ...model,
+    ...(model.reasoningEfforts
+      ? { reasoningEfforts: model.reasoningEfforts.map((effort) => ({ ...effort })) }
+      : {}),
+  }));
+}
+
+export function reconnectModelSelection(
+  runtime: Pick<RuntimeSnapshot, "currentModelId">,
+  enabledModels: readonly ModelInfo[],
+  preference: { modelId: string | null; reasoningEffort: string | null },
+): { modelId?: string; reasoningEffort?: string } {
+  const requestedModelId = runtime.currentModelId ?? preference.modelId;
+  const model = enabledModels.find((candidate) => candidate.id === requestedModelId);
+  if (!model) return {};
+
+  const reasoningEffort = preference.modelId === model.id
+    ? preference.reasoningEffort
+    : null;
+  return {
+    modelId: model.id,
+    ...(reasoningEffort && model.reasoningEfforts?.some((effort) => effort.id === reasoningEffort)
+      ? { reasoningEffort }
+      : {}),
+  };
+}
+
+export interface ActiveModelControl {
+  currentModelId: string;
+  configId: string | null;
+  strategy: "session" | "reconnect";
+  models: ModelInfo[];
+}
+
+export function getActiveModelControl(
+  view: SessionViewState | undefined,
+  runtime: RuntimeSnapshot,
+  enabledModels: readonly ModelInfo[],
+): ActiveModelControl | null {
+  const sessionModel = view?.configOptions.find(
+    (option) => option.type === "select" && option.category === "model",
+  );
+  const allowedIds = new Set(enabledModels.map((model) => model.id));
+  const sessionModels = sessionModel?.type === "select"
+    ? (sessionModel.options ?? []).flatMap((option): ModelInfo[] =>
+        allowedIds.size === 0 || allowedIds.has(option.value)
+          ? [{ id: option.value, name: option.name, ...(option.description ? { description: option.description } : {}) }]
+          : [])
+    : [];
+  const models = sessionModels.length > 0
+    ? sessionModels
+    : enabledModels.map((model) => ({ ...model }));
+  if (models.length === 0) return null;
+
+  const requestedCurrent = sessionModel?.type === "select" && typeof sessionModel.currentValue === "string"
+    ? sessionModel.currentValue
+    : runtime.currentModelId;
+  const currentModelId = requestedCurrent && models.some((model) => model.id === requestedCurrent)
+    ? requestedCurrent
+    : models[0]!.id;
+  const sessionEditable = Boolean(sessionModel && !sessionModel.readOnly);
+  return {
+    currentModelId,
+    configId: sessionEditable ? sessionModel!.id : null,
+    strategy: sessionEditable ? "session" : "reconnect",
+    models,
+  };
+}
+
 function useDialogFocus<T extends HTMLElement>(identity: string) {
   const dialogRef = useRef<T>(null);
   useEffect(() => {
@@ -1053,6 +1109,12 @@ function App() {
   const [permissionMode, setPermissionMode] = useState<PermissionModePreference>("default");
   const [xaiApiBaseUrl, setXaiApiBaseUrl] = useState("");
   const [xaiApiKey, setXaiApiKey] = useState("");
+  const [modelCatalog, setModelCatalog] = useState<ModelInfo[]>([]);
+  const [enabledModelIds, setEnabledModelIds] = useState<string[]>([]);
+  const [reconnectModelPreference, setReconnectModelPreference] = useState<{
+    modelId: string | null;
+    reasoningEffort: string | null;
+  }>({ modelId: null, reasoningEffort: null });
   const [workspaceMcpConfigs, setWorkspaceMcpConfigs] = useState<WorkspaceMcpConfigs>({});
   const [configBusyId, setConfigBusyId] = useState<string | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("activity");
@@ -1068,7 +1130,6 @@ function App() {
   const noticeCounter = useRef(0);
   const xaiApiKeyRef = useRef("");
   const workspaceConnectionBusyRef = useRef(false);
-  const workspaceMcpConfigsRef = useRef<WorkspaceMcpConfigs>({});
   const lastEventSequence = useRef(0);
   const pendingEventEnvelopes = useRef<DesktopEventEnvelope[]>([]);
   const rendererSynchronized = useRef(false);
@@ -1118,8 +1179,6 @@ function App() {
     }
   }, []);
 
-  workspaceMcpConfigsRef.current = workspaceMcpConfigs;
-
   const acquireWorkspaceConnection = useCallback((): (() => void) | null => {
     return acquireWorkspaceConnectionLock(
       workspaceConnectionBusyRef,
@@ -1135,6 +1194,20 @@ function App() {
         )
       : snapshot.message;
     setRuntime(message === snapshot.message ? snapshot : { ...snapshot, message });
+    if (snapshot.availableModels.length > 0) {
+      const models = snapshot.availableModels.map((model) => ({
+        ...model,
+        ...(model.reasoningEfforts
+          ? { reasoningEfforts: model.reasoningEfforts.map((effort) => ({ ...effort })) }
+          : {}),
+      }));
+      setModelCatalog(models);
+      setEnabledModelIds((current) => {
+        const available = new Set(models.map((model) => model.id));
+        const retained = current.filter((modelId) => available.has(modelId));
+        return retained.length > 0 ? retained : models.map((model) => model.id);
+      });
+    }
     if (snapshot.permissionMode) setPermissionMode(snapshot.permissionMode);
     setSelectedWorkspacePath((current) =>
       resolveWorkspaceContext(snapshot.workspacePath, current, null),
@@ -1348,7 +1421,9 @@ function App() {
         const configuredPermissionMode = sync.runtime.permissionMode
           ?? payload.settings.permissionMode;
         setPermissionMode(configuredPermissionMode);
-        const configuredBaseUrlError = validateXaiApiBaseUrl(configuredBaseUrl);
+        const configuredBaseUrlError = configuredBaseUrl
+          ? validateXaiApiBaseUrl(configuredBaseUrl)
+          : null;
         if (configuredBaseUrlError) {
           pushNotice(`已保存的 API Base URL 无效：${configuredBaseUrlError}`, "warning");
         } else if (
@@ -1356,51 +1431,13 @@ function App() {
           payload.installation.found &&
           lastWorkspace
         ) {
-          if (!shouldAutoConnectWorkspace(configuredBaseUrl)) {
-            openSettings(lastWorkspace);
-            pushNotice("自定义远程 URL 已保留；API Key 不会保存，请重新输入后连接。", "info");
-            return;
-          }
-          const releaseConnection = acquireWorkspaceConnection();
-          if (!releaseConnection) return;
-          try {
-            const requestedMcpServers = readWorkspaceMcpServers(
-              workspaceMcpConfigsRef.current,
-              lastWorkspace,
-              payload.platform,
-            );
-            const result = await window.grokDesktop.connect({
-              workspacePath: lastWorkspace,
-              ...(payload.installation.executablePath ? { executablePath: payload.installation.executablePath } : {}),
-              permissionMode: configuredPermissionMode,
-              xaiApiBaseUrl: normalizeXaiApiBaseUrl(configuredBaseUrl),
-              ...(xaiApiKeyRef.current ? { xaiApiKey: xaiApiKeyRef.current } : {}),
-              ...(requestedMcpServers.length > 0 ? { mcpServers: requestedMcpServers } : {}),
-            });
-            if (alive) {
-              const snapshot = result.snapshot;
-              const canonicalWorkspacePath = snapshot.workspacePath ?? lastWorkspace;
-              setWorkspaceMcpConfigs((configs) => writeWorkspaceMcpServers(
-                configs,
-                canonicalWorkspacePath,
-                requestedMcpServers,
-                payload.platform,
-                lastWorkspace,
-              ));
-              acceptRuntimeSnapshot(snapshot);
-              setBaseUrlPersistenceFailed(!result.xaiApiBaseUrlPersisted);
-              if (!result.xaiApiBaseUrlPersisted) {
-                pushNotice("已连接，但 API Base URL 无法写入磁盘；重启后需要重新设置。", "warning");
-              }
-              if (!result.permissionModePersisted) {
-                pushNotice("已连接，但权限模式无法写入磁盘；重启后将恢复逐项授权。", "warning");
-              }
-            }
-          } catch (error) {
-            if (alive) pushNotice(userFacingErrorMessage(error, "最近项目连接失败"), "warning");
-          } finally {
-            releaseConnection();
-          }
+          openSettings(lastWorkspace);
+          pushNotice(
+            configuredBaseUrl
+              ? "API Base URL 已保留；API Key 不会保存，请重新输入并获取模型后连接。"
+              : "请输入 API Base URL 和 API Key，获取模型后连接项目。",
+            "info",
+          );
         }
       } catch (error) {
         if (alive) setBootstrapError(userFacingErrorMessage(error, "桌面端初始化失败"));
@@ -1422,6 +1459,7 @@ function App() {
   ]);
 
   const currentView = activeSession ? views[activeSession.sessionId] ?? createEmptySessionView() : undefined;
+  const activeEnabledModels = selectEnabledModels(modelCatalog, enabledModelIds);
   const workspacePath = selectedWorkspacePath;
   const platform = bootstrap?.platform ?? "win32";
   const settingsWorkspacePath = settingsTargetWorkspacePath === undefined
@@ -1533,9 +1571,9 @@ function App() {
       openSettings(path);
       return null;
     }
-    const baseUrlError = validateXaiApiBaseUrl(requestedBaseUrl);
-    if (baseUrlError) {
-      pushNotice(`API Base URL 无效：${baseUrlError}`, "warning");
+    const connectionError = validateXaiConnectionPair(requestedBaseUrl, requestedApiKey);
+    if (connectionError) {
+      pushNotice(`连接设置无效：${connectionError}`, "warning");
       openSettings(path);
       return null;
     }
@@ -1555,6 +1593,18 @@ function App() {
       return null;
     }
     const normalizedMcpServers = normalizeMcpServers(requestedMcpServers);
+    const requestedModel = settings
+      ? {
+          ...(settings.modelId ? { modelId: settings.modelId } : {}),
+          ...(settings.modelId && settings.reasoningEffort
+            ? { reasoningEffort: settings.reasoningEffort }
+            : {}),
+        }
+      : reconnectModelSelection(
+          runtime,
+          selectEnabledModels(modelCatalog, enabledModelIds),
+          reconnectModelPreference,
+        );
     const releaseConnection = acquireWorkspaceConnection();
     if (!releaseConnection) return null;
     try {
@@ -1565,15 +1615,21 @@ function App() {
       const result = await window.grokDesktop.connect({
         workspacePath: path,
         ...(installation?.executablePath ? { executablePath: installation.executablePath } : {}),
-        ...(settings?.modelId ? { modelId: settings.modelId } : {}),
-        ...(settings?.reasoningEffort ? { reasoningEffort: settings.reasoningEffort } : {}),
+        ...requestedModel,
         permissionMode: requestedPermissionMode,
         xaiApiBaseUrl: normalizeXaiApiBaseUrl(requestedBaseUrl),
-        ...(requestedApiKey ? { xaiApiKey: requestedApiKey } : {}),
+        xaiApiKey: requestedApiKey,
         ...(normalizedMcpServers.length > 0 ? { mcpServers: normalizedMcpServers } : {}),
         ...(settings?.allowStdioMcpExecution ? { allowStdioMcpExecution: true as const } : {}),
       });
       const snapshot = result.snapshot;
+      const connectedModelId = snapshot.currentModelId ?? requestedModel.modelId ?? null;
+      setReconnectModelPreference({
+        modelId: connectedModelId,
+        reasoningEffort: connectedModelId && connectedModelId === requestedModel.modelId
+          ? requestedModel.reasoningEffort ?? null
+          : null,
+      });
       setActiveSession(null);
       setMountedSessions({});
       const canonicalWorkspacePath = snapshot.workspacePath ?? path;
@@ -1585,6 +1641,7 @@ function App() {
         path,
       ));
       acceptRuntimeSnapshot(snapshot);
+      if (snapshot.xaiApiBaseUrl) setXaiApiBaseUrl(snapshot.xaiApiBaseUrl);
       setBaseUrlPersistenceFailed(!result.xaiApiBaseUrlPersisted);
       if (!result.xaiApiBaseUrlPersisted) {
         pushNotice("已连接，但 API Base URL 无法写入磁盘；重启后需要重新设置。", "warning");
@@ -1610,10 +1667,13 @@ function App() {
     permissionMode,
     installation?.executablePath,
     mainView,
+    modelCatalog,
+    enabledModelIds,
     openSettings,
     platform,
     pushNotice,
     runtime,
+    reconnectModelPreference,
     workspaceMcpConfigs,
     xaiApiBaseUrl,
     xaiApiKey,
@@ -1674,8 +1734,10 @@ function App() {
     try {
       const normalizedBaseUrl = normalizeXaiApiBaseUrl(settings.baseUrl);
       const normalizedSettings = {
-        baseUrl: normalizedBaseUrl ?? "",
+        baseUrl: normalizedBaseUrl,
         apiKey: normalizeXaiApiKey(settings.apiKey),
+        models: settings.models.map((model) => ({ ...model })),
+        enabledModelIds: [...settings.enabledModelIds],
         permissionMode: settings.permissionMode,
         modelId: settings.modelId,
         reasoningEffort: settings.reasoningEffort,
@@ -1686,6 +1748,11 @@ function App() {
         if (normalizedSettings.mcpServers.length > 0) {
           throw new Error("请先选择工作区，再配置 MCP 服务器。");
         }
+        const connectionError = validateXaiConnectionPair(
+          normalizedSettings.baseUrl,
+          normalizedSettings.apiKey,
+        );
+        if (connectionError) throw new Error(connectionError);
         const savedBaseUrl = await window.grokDesktop.setXaiApiBaseUrl(normalizedBaseUrl);
         const savedPermissionMode = await window.grokDesktop.setPermissionMode(
           normalizedSettings.permissionMode,
@@ -1694,15 +1761,29 @@ function App() {
         setXaiApiBaseUrl(savedBaseUrl ?? "");
         setXaiApiKey(normalizedSettings.apiKey);
         xaiApiKeyRef.current = normalizedSettings.apiKey;
+        setModelCatalog(normalizedSettings.models);
+        setEnabledModelIds(normalizedSettings.enabledModelIds);
+        setReconnectModelPreference({
+          modelId: normalizedSettings.modelId,
+          reasoningEffort: normalizedSettings.modelId
+            ? normalizedSettings.reasoningEffort
+            : null,
+        });
         setPermissionMode(savedPermissionMode);
         pushNotice("连接设置已保存，将在下次打开项目时应用");
         return true;
       }
       const snapshot = await connectWorkspace(targetWorkspacePath, normalizedSettings);
       if (!snapshot) return false;
-      setXaiApiBaseUrl(normalizedSettings.baseUrl);
+      setXaiApiBaseUrl(snapshot.xaiApiBaseUrl ?? normalizedSettings.baseUrl);
       setXaiApiKey(normalizedSettings.apiKey);
       xaiApiKeyRef.current = normalizedSettings.apiKey;
+      setModelCatalog(normalizedSettings.models.length > 0
+        ? normalizedSettings.models
+        : snapshot.availableModels);
+      setEnabledModelIds(normalizedSettings.enabledModelIds.length > 0
+        ? normalizedSettings.enabledModelIds
+        : snapshot.availableModels.map((model) => model.id));
       setPermissionMode(normalizedSettings.permissionMode);
       return true;
     } catch (error) {
@@ -1722,6 +1803,11 @@ function App() {
       setRuntime(EMPTY_RUNTIME);
       setActiveSession(null);
       setMountedSessions({});
+      setXaiApiKey("");
+      xaiApiKeyRef.current = "";
+      setModelCatalog([]);
+      setEnabledModelIds([]);
+      setReconnectModelPreference({ modelId: null, reasoningEffort: null });
       closeSettings();
     } catch (error) {
       pushNotice(userFacingErrorMessage(error, "断开连接失败"), "error");
@@ -2009,6 +2095,48 @@ function App() {
     }
   };
 
+  const changeModel = async (modelId: string) => {
+    const control = getActiveModelControl(currentView, runtime, activeEnabledModels);
+    if (!control || !control.models.some((model) => model.id === modelId)) return;
+    if (modelId === control.currentModelId || anyTaskBusy || workspaceConnectionBusyRef.current) return;
+
+    if (control.strategy === "session" && control.configId && activeSession) {
+      await changeConfig(control.configId, modelId);
+      return;
+    }
+    if (!workspacePath || !xaiApiBaseUrl || !xaiApiKey) {
+      pushNotice("切换进程模型需要当前 URL 和内存 API Key，请在设置中重新输入。", "warning");
+      openSettings(workspacePath);
+      return;
+    }
+    const mcpServers = readWorkspaceMcpServers(
+      workspaceMcpConfigs,
+      workspacePath,
+      platform,
+    );
+    if (mcpServers.some((server) => server.type === "stdio")) {
+      pushNotice("切换进程模型会重连；请在设置中重新确认本地 MCP 程序。", "warning");
+      openSettings(workspacePath);
+      return;
+    }
+
+    const snapshot = await connectWorkspace(workspacePath, {
+      baseUrl: xaiApiBaseUrl,
+      apiKey: xaiApiKey,
+      models: modelCatalog,
+      enabledModelIds,
+      permissionMode,
+      modelId,
+      reasoningEffort: preferredReasoningEffort(modelCatalog, modelId) || null,
+      mcpServers,
+      allowStdioMcpExecution: false,
+    });
+    if (snapshot) {
+      const modelName = activeEnabledModels.find((model) => model.id === modelId)?.name ?? modelId;
+      pushNotice(`已使用 ${modelName} 重新连接；新任务将使用该模型。`);
+    }
+  };
+
   const resolvePermission = useCallback(async (optionId: string | null) => {
     if (!permission || permissionBusy) return;
     setPermissionBusy(true);
@@ -2116,10 +2244,13 @@ function App() {
               currentView={currentView}
               execution={currentExecution}
               isWorking={isWorking}
+              models={activeEnabledModels}
+              modelBusy={configBusyId !== null}
               onAttachContextFiles={() => void chooseContextFiles()}
               onCancel={() => void cancelTurn()}
               onChangeComposer={setComposer}
               onChangeMode={(modeId) => void changeMode(modeId)}
+              onChangeModel={(modelId) => void changeModel(modelId)}
               onCreateSession={beginNewTask}
               onDismissReplayWarning={() => setReplayHistoryIncomplete(false)}
               onOpenConnectionSettings={() => openSettings(workspacePath)}
@@ -2163,19 +2294,16 @@ function App() {
           bootstrap={bootstrap!}
           key={workspaceMcpConfigKey(settingsWorkspacePath, platform) ?? "global-settings"}
           installation={installation}
+          modelCatalog={modelCatalog}
+          enabledModelIds={enabledModelIds}
           connectionBusy={workspaceConnectionBusy}
           onChooseExecutable={() => void chooseExecutable()}
           onClose={closeSettings}
           onDisconnect={() => void disconnectFromSettings()}
-          onOpenTerminal={() => {
-            closeSettings();
-            if (mainView !== "terminal") void toggleTerminal();
-          }}
           onApplyConnectionSettings={applyConnectionSettings}
           runtime={runtime}
           mcpServers={settingsMcpServers}
           taskBusy={anyTaskBusy}
-          terminalMode={mainView === "terminal"}
           workspacePath={settingsWorkspacePath}
           xaiApiBaseUrl={xaiApiBaseUrl}
           xaiApiKey={xaiApiKey}
@@ -2525,6 +2653,8 @@ interface ConversationStageProps {
   canUseSession: boolean;
   connectionBusy: boolean;
   isWorking: boolean;
+  models: ModelInfo[];
+  modelBusy: boolean;
   composer: string;
   contextFiles: ContextFileReference[];
   reconnectBlocked: boolean;
@@ -2533,6 +2663,7 @@ interface ConversationStageProps {
   onCreateSession(): void;
   onAttachContextFiles(): void;
   onChangeMode(modeId: string): void;
+  onChangeModel(modelId: string): void;
   onChangePermissionMode(mode: PermissionModePreference): void;
   onChangeComposer(value: string): void;
   onSubmit(): void;
@@ -2577,6 +2708,7 @@ function ConversationStage(props: ConversationStageProps) {
   const visibleOutcomePresentation = isWorking ? null : outcomePresentation;
   const outcomeDetail = currentView?.turnError || execution?.error || outcomePresentation?.detail || null;
   const modelLabel = getActiveModelLabel(currentView, runtime);
+  const modelControl = getActiveModelControl(currentView, runtime, props.models);
   const connectionBadge = getXaiConnectionBadge(runtime);
   const presentationTimeline = useMemo(
     () => projectTimelinePresentation(timeline),
@@ -2691,7 +2823,7 @@ function ConversationStage(props: ConversationStageProps) {
           )}
           {isWorking ? <button aria-busy={isCancelling} aria-label={isCancelling ? "正在停止执行" : "停止执行"} className="composer__action composer__action--stop" disabled={isCancelling} onClick={props.onCancel} title={isCancelling ? "正在等待 Grok 确认停止" : "停止执行"} type="button"><StopIcon size={16}/></button> : <button className="composer__action" aria-label="发送" disabled={!props.composer.trim() || !canUseSession} onClick={props.onSubmit} type="button"><ArrowUpIcon size={17}/></button>}
         </div>
-        <div className="composer-meta"><span>{modelLabel}</span>{connectionBadge && <button className="composer-connection" data-key-configured={connectionBadge.keyConfigured} onClick={props.onOpenConnectionSettings} title={connectionBadge.title} type="button"><i/>{connectionBadge.label}</button>}<PermissionModeControl disabled={props.connectionBusy || props.reconnectBlocked} mode={runtime.permissionMode ?? props.permissionMode} onChange={props.onChangePermissionMode}/><span className="composer-shortcut">Enter 发送 · Shift+Enter 换行</span>{props.contextFiles.length > 0 && <span>{props.contextFiles.length} 个文件</span>}<UsageDisclosure view={currentView}/></div>
+        <div className="composer-meta">{modelControl ? <label className="composer-model-select" title={modelControl.strategy === "session" ? "切换当前会话模型" : "切换后会重新连接，历史任务仍保留"}><span>模型</span><select aria-label="当前模型" disabled={isWorking || props.connectionBusy || props.modelBusy || props.reconnectBlocked} onChange={(event) => props.onChangeModel(event.target.value)} value={modelControl.currentModelId}>{modelControl.models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label> : <span>{modelLabel}</span>}{connectionBadge && <button className="composer-connection" data-key-configured={connectionBadge.keyConfigured} onClick={props.onOpenConnectionSettings} title={connectionBadge.title} type="button"><i/>{connectionBadge.label}</button>}<PermissionModeControl disabled={props.connectionBusy || props.reconnectBlocked} mode={runtime.permissionMode ?? props.permissionMode} onChange={props.onChangePermissionMode}/><span className="composer-shortcut">Enter 发送 · Shift+Enter 换行</span>{props.contextFiles.length > 0 && <span>{props.contextFiles.length} 个文件</span>}<UsageDisclosure view={currentView}/></div>
       </div>
     </section>
   );
@@ -3125,9 +3257,10 @@ interface SettingsModalProps {
   bootstrap: BootstrapPayload;
   connectionBusy: boolean;
   installation: GrokInstallation | null;
+  modelCatalog: ModelInfo[];
+  enabledModelIds: string[];
   runtime: RuntimeSnapshot;
   taskBusy: boolean;
-  terminalMode: boolean;
   permissionMode: PermissionModePreference;
   xaiApiBaseUrl: string;
   xaiApiKey: string;
@@ -3135,7 +3268,6 @@ interface SettingsModalProps {
   workspacePath: string | null;
   onChooseExecutable(): void;
   onDisconnect(): void;
-  onOpenTerminal(): void;
   onApplyConnectionSettings(
     workspacePath: string | null,
     settings: ConnectionSettingsDraft,
@@ -3147,9 +3279,10 @@ function SettingsModal({
   bootstrap,
   connectionBusy,
   installation,
+  modelCatalog,
+  enabledModelIds,
   runtime,
   taskBusy,
-  terminalMode,
   permissionMode,
   xaiApiBaseUrl,
   xaiApiKey,
@@ -3157,13 +3290,26 @@ function SettingsModal({
   workspacePath,
   onChooseExecutable,
   onDisconnect,
-  onOpenTerminal,
   onApplyConnectionSettings,
   onClose,
 }: SettingsModalProps) {
   const dialogRef = useDialogFocus<HTMLElement>("settings");
   const [draftBaseUrl, setDraftBaseUrl] = useState(xaiApiBaseUrl);
   const [draftApiKey, setDraftApiKey] = useState(xaiApiKey);
+  const initialModels = modelCatalog.length > 0 ? modelCatalog : runtime.availableModels;
+  const [draftModels, setDraftModels] = useState<ModelInfo[]>(() =>
+    initialModels.map((model) => ({ ...model })),
+  );
+  const [draftEnabledModelIds, setDraftEnabledModelIds] = useState<string[]>(() => {
+    const available = new Set(initialModels.map((model) => model.id));
+    const retained = enabledModelIds.filter((modelId) => available.has(modelId));
+    return retained.length > 0 ? retained : initialModels.map((model) => model.id);
+  });
+  const [modelDiscoveryPhase, setModelDiscoveryPhase] = useState<ModelDiscoveryPhase>(
+    initialModels.length > 0 ? "ready" : "idle",
+  );
+  const [modelDiscoveryMessage, setModelDiscoveryMessage] = useState<string | null>(null);
+  const modelDiscoveryRevision = useRef(0);
   const [draftPermissionMode, setDraftPermissionMode] = useState(permissionMode);
   const [draftMcpServers, setDraftMcpServers] = useState<EditableMcpServer[]>(
     () => createEditableMcpServers(mcpServers),
@@ -3175,27 +3321,22 @@ function SettingsModal({
   );
   const [apiKeyClearedForEndpointChange, setApiKeyClearedForEndpointChange] = useState(false);
   const [draftModelId, setDraftModelId] = useState(() =>
-    runtime.currentModelId && runtime.availableModels.some(
+    runtime.currentModelId && initialModels.some(
       (model) => model.id === runtime.currentModelId,
     )
       ? runtime.currentModelId
       : "",
   );
   const [draftReasoningEffort, setDraftReasoningEffort] = useState(() =>
-    preferredReasoningEffort(runtime.availableModels, runtime.currentModelId),
+    preferredReasoningEffort(initialModels, runtime.currentModelId),
   );
   const [showApiKey, setShowApiKey] = useState(false);
   const baseUrlError = validateXaiApiBaseUrl(draftBaseUrl);
   const baseUrlAdvisory = baseUrlError ? null : xaiApiBaseUrlAdvisory(draftBaseUrl);
+  const connectionPairError = validateXaiConnectionPair(draftBaseUrl, draftApiKey);
   const capabilitiesAuthoritative = runtimeCapabilitiesApplyToExecutable(
     runtime,
     installation?.executablePath,
-  );
-  const authMethodPresentations = capabilitiesAuthoritative
-    ? getAuthMethodPresentations(runtime.authMethods, draftBaseUrl)
-    : [];
-  const grokManagedLoginAdvertised = authMethodPresentations.some(
-    (method) => method.managedLogin,
   );
   const mcpValidationError = mcpSettingsError(
     draftMcpServers,
@@ -3224,14 +3365,17 @@ function SettingsModal({
     ? MCP_TRANSPORTS.filter((transport) => runtime.capabilities.mcp[transport])
     : [...MCP_TRANSPORTS];
   const selectedReasoningEfforts = useMemo(
-    () => reasoningEffortsForModel(runtime.availableModels, draftModelId || null),
-    [draftModelId, runtime.availableModels],
+    () => reasoningEffortsForModel(draftModels, draftModelId || null),
+    [draftModelId, draftModels],
   );
   const selectedReasoningEffort = selectedReasoningEfforts.find(
     (effort) => effort.id === draftReasoningEffort,
   );
   const currentApiKeyScope = getXaiApiCredentialScope(draftBaseUrl);
-  const apiKeyTargetInvalid = draftBaseUrl.trim().length > 0 && currentApiKeyScope === undefined;
+  const apiKeyTargetInvalid = currentApiKeyScope === undefined || currentApiKeyScope === null;
+  const enabledModels = selectEnabledModels(draftModels, draftEnabledModelIds);
+  const modelSelectionInvalid = enabledModels.length === 0 ||
+    !enabledModels.some((model) => model.id === draftModelId);
   const apiKeyReentryRequired = requiresXaiApiKeyReentry(
     runtime,
     draftBaseUrl,
@@ -3247,24 +3391,24 @@ function SettingsModal({
 
   useEffect(() => {
     setDraftModelId((current) => {
-      if (runtime.availableModels.some((model) => model.id === current)) {
+      if (draftModels.some((model) => model.id === current)) {
         return current;
       }
-      return runtime.currentModelId && runtime.availableModels.some(
+      return runtime.currentModelId && draftModels.some(
         (model) => model.id === runtime.currentModelId,
       )
         ? runtime.currentModelId
-        : "";
+        : draftModels[0]?.id ?? "";
     });
-  }, [runtime.availableModels, runtime.currentModelId]);
+  }, [draftModels, runtime.currentModelId]);
 
   useEffect(() => {
     setDraftReasoningEffort((current) => current === "" || selectedReasoningEfforts.some(
       (effort) => effort.id === current,
     )
       ? current
-      : preferredReasoningEffort(runtime.availableModels, draftModelId || null));
-  }, [draftModelId, runtime.availableModels, selectedReasoningEfforts]);
+      : preferredReasoningEffort(draftModels, draftModelId || null));
+  }, [draftModelId, draftModels, selectedReasoningEfforts]);
 
   useEffect(() => {
     const hideSecrets = () => {
@@ -3284,6 +3428,16 @@ function SettingsModal({
     return () => window.removeEventListener("blur", hideSecrets);
   }, []);
 
+  const invalidateDiscoveredModels = () => {
+    modelDiscoveryRevision.current += 1;
+    setDraftModels([]);
+    setDraftEnabledModelIds([]);
+    setDraftModelId("");
+    setDraftReasoningEffort("");
+    setModelDiscoveryPhase("idle");
+    setModelDiscoveryMessage(null);
+  };
+
   const changeBaseUrl = (nextBaseUrl: string) => {
     const transition = transitionXaiApiKeyForBaseUrl(
       draftApiKey,
@@ -3293,6 +3447,7 @@ function SettingsModal({
     setDraftBaseUrl(nextBaseUrl);
     setDraftApiKey(transition.apiKey);
     setApiKeyScope(transition.apiKeyScope);
+    invalidateDiscoveredModels();
     if (transition.cleared) {
       setShowApiKey(false);
       setApiKeyClearedForEndpointChange(true);
@@ -3304,6 +3459,77 @@ function SettingsModal({
     setApiKeyScope(getXaiApiCredentialScope(draftBaseUrl));
     setApiKeyClearedForEndpointChange(false);
     if (!nextApiKey) setShowApiKey(false);
+    invalidateDiscoveredModels();
+  };
+
+  const discoverModels = async () => {
+    const validationError = validateXaiConnectionPair(draftBaseUrl, draftApiKey);
+    if (validationError || !workspacePath || !installation?.executablePath || connectionBusy) {
+      setModelDiscoveryPhase("error");
+      setModelDiscoveryMessage(
+        validationError ?? (!workspacePath
+          ? "请先选择工作区，再检测地址和获取模型。"
+          : "未找到可用的 Grok CLI。"),
+      );
+      return;
+    }
+
+    const revision = ++modelDiscoveryRevision.current;
+    setModelDiscoveryPhase("loading");
+    setModelDiscoveryMessage("正在通过 Grok ACP 检测同源 API 路径并获取模型…");
+    try {
+      const result = await window.grokDesktop.discoverModels({
+        workspacePath,
+        executablePath: installation.executablePath,
+        xaiApiBaseUrl: normalizeXaiApiBaseUrl(draftBaseUrl),
+        xaiApiKey: normalizeXaiApiKey(draftApiKey),
+      });
+      if (revision !== modelDiscoveryRevision.current) return;
+      const models = result.models.map((model) => ({ ...model }));
+      if (models.length === 0) {
+        setDraftModels([]);
+        setDraftEnabledModelIds([]);
+        setDraftModelId("");
+        setModelDiscoveryPhase("error");
+        setModelDiscoveryMessage("地址已通过 ACP 初始化，但 Grok 没有返回可用模型。");
+        return;
+      }
+      const selectedModelId = result.currentModelId && models.some(
+        (model) => model.id === result.currentModelId,
+      )
+        ? result.currentModelId
+        : models[0]!.id;
+      setDraftBaseUrl(result.resolvedBaseUrl);
+      setApiKeyScope(getXaiApiCredentialScope(result.resolvedBaseUrl));
+      setApiKeyClearedForEndpointChange(false);
+      setDraftModels(models);
+      setDraftEnabledModelIds(models.map((model) => model.id));
+      setDraftModelId(selectedModelId);
+      setDraftReasoningEffort(preferredReasoningEffort(models, selectedModelId));
+      setModelDiscoveryPhase("ready");
+      setModelDiscoveryMessage(`已匹配 ${result.resolvedBaseUrl}，获取 ${models.length} 个模型。`);
+    } catch (error) {
+      if (revision !== modelDiscoveryRevision.current) return;
+      setDraftModels([]);
+      setDraftEnabledModelIds([]);
+      setDraftModelId("");
+      setModelDiscoveryPhase("error");
+      setModelDiscoveryMessage(redactSensitiveText(
+        userFacingErrorMessage(error, "地址检测或模型获取失败"),
+        draftApiKey,
+      ));
+    }
+  };
+
+  const toggleModelEnabled = (modelId: string, enabled: boolean) => {
+    const next = enabled
+      ? [...new Set([...draftEnabledModelIds, modelId])]
+      : draftEnabledModelIds.filter((candidate) => candidate !== modelId);
+    setDraftEnabledModelIds(next);
+    if (!next.includes(draftModelId)) {
+      setDraftModelId(draftModels.find((model) => next.includes(model.id))?.id ?? "");
+      setDraftReasoningEffort("");
+    }
   };
 
   const updateMcpServer = (
@@ -3461,10 +3687,20 @@ function SettingsModal({
   };
 
   const applySettings = async () => {
-    if (baseUrlError || apiKeyReentryRequired || mcpConfigError || stdioConfirmationMissing || connectionBusy) return;
+    if (
+      connectionPairError ||
+      apiKeyReentryRequired ||
+      modelDiscoveryPhase !== "ready" ||
+      modelSelectionInvalid ||
+      mcpConfigError ||
+      stdioConfirmationMissing ||
+      connectionBusy
+    ) return;
     const applied = await onApplyConnectionSettings(workspacePath, {
         baseUrl: draftBaseUrl,
         apiKey: draftApiKey,
+        models: draftModels,
+        enabledModelIds: draftEnabledModelIds,
         permissionMode: draftPermissionMode,
         modelId: draftModelId || null,
         reasoningEffort: draftReasoningEffort || null,
@@ -3502,7 +3738,7 @@ function SettingsModal({
           </section>
 
           <section className="settings-group" aria-labelledby="connection-settings-title">
-            <div className="settings-group__heading"><h3 id="connection-settings-title">xAI API 连接</h3><p>用于结构化 ACP 连接。留空时使用 Grok 的默认地址；远程地址必须使用 HTTPS，本机开发服务可使用 HTTP。</p></div>
+            <div className="settings-group__heading"><h3 id="connection-settings-title">API 连接</h3><p>结构化连接只支持用户明确提供的 URL + API Key。远程地址必须使用 HTTPS，本机开发服务可使用 HTTP。</p></div>
             <div className="settings-field">
               <label htmlFor="xai-api-base-url">API Base URL</label>
               <input
@@ -3515,12 +3751,12 @@ function SettingsModal({
                 inputMode="url"
                 maxLength={MAX_XAI_API_BASE_URL_LENGTH}
                 onChange={(event) => changeBaseUrl(event.target.value)}
-                placeholder="https://api.x.ai/v1"
+                placeholder="输入兼容 API Base URL"
                 spellCheck={false}
                 type="text"
                 value={draftBaseUrl}
               />
-              <small id="xai-api-base-url-help">Base URL 会在连接项目时保存到桌面设置，并用于后续连接；清空后恢复 Grok 默认值。</small>
+              <small id="xai-api-base-url-help">可以输入任意兼容服务商地址。检测只在相同 Origin 内尝试候选 API 路径；成功连接后保存解析出的 URL。</small>
               {baseUrlError && <small className="settings-field__error" id="xai-api-base-url-error" role="status">{baseUrlError}</small>}
               {baseUrlAdvisory && <small className="settings-field__notice" id="xai-api-base-url-advisory" role="note">{baseUrlAdvisory}</small>}
             </div>
@@ -3548,28 +3784,80 @@ function SettingsModal({
               {draftApiKey && <small className="settings-field__notice" id="xai-api-key-cli-mcp-notice" role="note">桌面端只隔离本页注入的 stdio MCP；Grok CLI 自行管理的 MCP 属于外部 Grok 配置，可能继承 Grok 进程环境中的本次 Key。</small>}
               {apiKeyTargetInvalid && <small className="settings-field__notice" id="xai-api-key-target-notice" role="status">先输入有效的 API Base URL，再绑定 API Key。</small>}
               {apiKeyClearedForEndpointChange && <small className="settings-field__notice" id="xai-api-key-scope-notice" role="status">旧 API Key 已从设置草稿移除；应用并重新连接后将停止使用原凭据。</small>}
-              {apiKeyReentryRequired && <small className="settings-field__notice" id="xai-api-key-reentry-notice" role="status">当前 Grok 连接仍在使用只存在于主进程内存中的 API Key。为避免重连时丢失凭据，请重新输入；若改用其他 Origin，可留空。</small>}
+              {apiKeyReentryRequired && <small className="settings-field__notice" id="xai-api-key-reentry-notice" role="status">当前 Grok 连接仍在使用只存在于主进程内存中的 API Key。重新连接前必须再次输入。</small>}
             </div>
 
-            {authMethodPresentations.length > 0 && (
-              <section aria-label="Grok 原生认证方式" className="native-auth-summary">
-                <header><strong>Grok 原生认证</strong><small>来自当前 ACP 响应</small></header>
-                <ul>{authMethodPresentations.map((method) => <li key={method.id}><span>{method.label}</span><small>{method.detail}</small></li>)}</ul>
-                {grokManagedLoginAdvertised && (
-                  <footer>
-                    <span>登录流程仍由外部 Grok CLI 管理，不会在桌面端保存 Cookie、Token 或认证码。</span>
-                    <button
-                      className="subtle-button"
-                      disabled={!workspacePath || taskBusy || connectionBusy}
-                      onClick={onOpenTerminal}
-                      title={!workspacePath ? "请先选择工作区" : taskBusy ? "请先停止正在运行的任务" : connectionBusy ? "正在更新连接" : undefined}
-                      type="button"
-                    >
-                      <TerminalIcon size={14}/>{terminalMode ? "返回原始终端" : "打开原始终端"}
-                    </button>
-                  </footer>
+            <div className="model-discovery-actions">
+              <button
+                aria-busy={modelDiscoveryPhase === "loading"}
+                className="subtle-button"
+                disabled={Boolean(connectionPairError) || !workspacePath || !installation?.executablePath || connectionBusy || modelDiscoveryPhase === "loading"}
+                onClick={() => void discoverModels()}
+                type="button"
+              >
+                {modelDiscoveryPhase === "loading" ? "正在检测…" : "检测地址并获取模型"}
+              </button>
+              <small>不会读取或保存外部 CLI 身份状态；API Key 只传给短生命周期 ACP 进程。</small>
+            </div>
+            {modelDiscoveryMessage && (
+              <div
+                aria-live="polite"
+                className={`model-discovery-status is-${modelDiscoveryPhase}`}
+                id="model-discovery-status"
+                role={modelDiscoveryPhase === "error" ? "alert" : "status"}
+              >
+                {modelDiscoveryMessage}
+              </div>
+            )}
+          </section>
+
+          <section className="settings-group model-settings" aria-labelledby="model-settings-title">
+            <div className="settings-group__heading"><h3 id="model-settings-title">可用模型</h3><p>模型来自当前 URL + Key 对应的 Grok ACP 响应。可以同时启用多个模型，并选择本次连接的初始模型。</p></div>
+            {draftModels.length === 0 ? (
+              <div className="model-settings__empty">
+                <strong>尚未获取模型</strong>
+                <span>先完成上方 URL 与 Key，再点击“检测地址并获取模型”。</span>
+              </div>
+            ) : (
+              <>
+                <div aria-label="启用的模型" className="model-catalog">
+                  {draftModels.map((model) => {
+                    const enabled = draftEnabledModelIds.includes(model.id);
+                    return (
+                      <label className={`model-catalog__item${enabled ? " is-enabled" : ""}`} key={model.id}>
+                        <input checked={enabled} disabled={connectionBusy || taskBusy} onChange={(event) => toggleModelEnabled(model.id, event.target.checked)} type="checkbox"/>
+                        <span><strong>{model.name}</strong><small>{model.id}</small>{model.description && <em>{model.description}</em>}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="settings-field">
+                  <label htmlFor="grok-model">初始模型</label>
+                  <select
+                    disabled={taskBusy || connectionBusy || enabledModels.length === 0}
+                    id="grok-model"
+                    onChange={(event) => {
+                      const nextModelId = event.target.value;
+                      setDraftModelId(nextModelId);
+                      setDraftReasoningEffort(preferredReasoningEffort(draftModels, nextModelId));
+                    }}
+                    value={draftModelId}
+                  >
+                    {enabledModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+                  </select>
+                  <small>应用时会先用同一连接重新验证模型，再把选择通过 Grok 的 `--model` 参数应用。</small>
+                </div>
+                {selectedReasoningEfforts.length > 0 && (
+                  <div className="settings-field">
+                    <label htmlFor="grok-reasoning-effort">思考强度</label>
+                    <select disabled={taskBusy || connectionBusy} id="grok-reasoning-effort" onChange={(event) => setDraftReasoningEffort(event.target.value)} value={draftReasoningEffort}>
+                      <option value="">使用模型默认思考强度</option>
+                      {selectedReasoningEfforts.map((effort) => <option key={effort.id} value={effort.id}>{effort.name}</option>)}
+                    </select>
+                    <small>{selectedReasoningEffort?.description ?? "仅显示 Grok ACP 为当前模型广告的档位。"}</small>
+                  </div>
                 )}
-              </section>
+              </>
             )}
           </section>
 
@@ -3753,47 +4041,6 @@ function SettingsModal({
               </div>
           </section>
 
-          {runtime.availableModels.length > 0 && (
-            <section className="settings-group" aria-labelledby="model-settings-title">
-              <div className="settings-group__heading"><h3 id="model-settings-title">Grok 模型</h3><p>列表来自当前 Grok ACP 响应。这里选择的是进程启动模型，会通过重新连接生效；若 Grok 另行提供可编辑的会话模型，任务检查器会按 ACP 能力显示。</p></div>
-              <div className="settings-field">
-                <label htmlFor="grok-model">运行模型</label>
-                <select
-                    disabled={taskBusy || connectionBusy}
-                    id="grok-model"
-                    onChange={(event) => {
-                      const nextModelId = event.target.value;
-                      setDraftModelId(nextModelId);
-                      setDraftReasoningEffort(preferredReasoningEffort(
-                        runtime.availableModels,
-                        nextModelId || null,
-                      ));
-                    }}
-                  value={draftModelId}
-                >
-                  <option value="">使用 Grok 默认模型</option>
-                  {runtime.availableModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
-                </select>
-                <small>选择后点击“应用并重新连接”生效；任务历史仍保留，正在执行或等待授权时不能切换。</small>
-              </div>
-              {selectedReasoningEfforts.length > 0 && (
-                <div className="settings-field">
-                  <label htmlFor="grok-reasoning-effort">思考强度</label>
-                  <select
-                    disabled={taskBusy || connectionBusy}
-                    id="grok-reasoning-effort"
-                    onChange={(event) => setDraftReasoningEffort(event.target.value)}
-                    value={draftReasoningEffort}
-                  >
-                    <option value="">使用模型默认思考强度</option>
-                    {selectedReasoningEfforts.map((effort) => <option key={effort.id} value={effort.id}>{effort.name}</option>)}
-                  </select>
-                  <small>{selectedReasoningEffort?.description ?? "仅显示当前模型通过 Grok ACP 广告的档位；应用并重新连接后生效。"}</small>
-                </div>
-              )}
-            </section>
-          )}
-
           <section className="settings-group" aria-labelledby="permission-settings-title">
             <div className="settings-group__heading"><h3 id="permission-settings-title">权限策略</h3><p>选择 Grok 原生权限模式。应用后会重新连接，正在运行任务时不能切换。</p></div>
             <div aria-label="权限策略" className="permission-mode-settings" role="radiogroup">
@@ -3816,13 +4063,13 @@ function SettingsModal({
 
           <section className="settings-group settings-meta" aria-labelledby="runtime-info-title">
             <div className="settings-group__heading"><h3 id="runtime-info-title">运行信息</h3></div>
-            <dl><div><dt>桌面端</dt><dd>v{bootstrap.appVersion}</dd></div><div><dt>Grok</dt><dd>{runtime.grokVersion || installation?.version || "未知"}</dd></div><div><dt>ACP</dt><dd>{runtime.protocolVersion ?? "未连接"}</dd></div><div><dt>API</dt><dd title={runtime.xaiApiBaseUrl ?? undefined}>{runtime.phase === "offline" ? "未连接" : runtime.xaiApiBaseUrl || "Grok 默认"}</dd></div><div><dt>权限</dt><dd>{runtime.permissionMode ? permissionModeLabel(runtime.permissionMode) : permissionModeLabel(draftPermissionMode)}</dd></div><div><dt>平台</dt><dd>{bootstrap.platform}</dd></div></dl>
+            <dl><div><dt>桌面端</dt><dd>v{bootstrap.appVersion}</dd></div><div><dt>Grok</dt><dd>{runtime.grokVersion || installation?.version || "未知"}</dd></div><div><dt>ACP</dt><dd>{runtime.protocolVersion ?? "未连接"}</dd></div><div><dt>API</dt><dd title={runtime.xaiApiBaseUrl ?? undefined}>{runtime.phase === "offline" ? "未连接" : runtime.xaiApiBaseUrl || "未配置"}</dd></div><div><dt>权限</dt><dd>{runtime.permissionMode ? permissionModeLabel(runtime.permissionMode) : permissionModeLabel(draftPermissionMode)}</dd></div><div><dt>平台</dt><dd>{bootstrap.platform}</dd></div></dl>
           </section>
         </div>
 
         <footer>
           <button aria-label={disconnectControl.label} className="danger-button" disabled={disconnectControl.disabled || connectionBusy} onClick={onDisconnect} title={disconnectControl.title} type="button">{disconnectControl.label}</button>
-          <div><button className="subtle-button" disabled={connectionBusy} onClick={requestClose} type="button">取消</button><button aria-busy={connectionBusy} aria-describedby={apiKeyReentryRequired ? "xai-api-key-reentry-notice" : mcpConfigError ? "mcp-settings-error" : stdioConfirmationMissing ? "mcp-stdio-confirmation" : undefined} className="primary-button" disabled={Boolean(baseUrlError) || apiKeyReentryRequired || Boolean(mcpConfigError) || stdioConfirmationMissing || connectionBusy || reconnectBlocked} onClick={() => void applySettings()} title={reconnectBlocked ? "请先停止当前任务，再重新连接" : apiKeyReentryRequired ? "请重新输入当前连接使用的 API Key" : mcpConfigError ?? (stdioConfirmationMissing ? "请先确认本地程序执行边界" : undefined)} type="button">{connectionBusy ? "正在应用…" : reconnectBlocked ? "任务运行中" : hasWorkspace ? "应用并重新连接" : "应用"}</button></div>
+          <div><button className="subtle-button" disabled={connectionBusy} onClick={requestClose} type="button">取消</button><button aria-busy={connectionBusy} aria-describedby={connectionPairError || modelDiscoveryPhase !== "ready" || modelSelectionInvalid ? "model-discovery-status" : apiKeyReentryRequired ? "xai-api-key-reentry-notice" : mcpConfigError ? "mcp-settings-error" : stdioConfirmationMissing ? "mcp-stdio-confirmation" : undefined} className="primary-button" disabled={Boolean(connectionPairError) || apiKeyReentryRequired || modelDiscoveryPhase !== "ready" || modelSelectionInvalid || Boolean(mcpConfigError) || stdioConfirmationMissing || connectionBusy || reconnectBlocked} onClick={() => void applySettings()} title={reconnectBlocked ? "请先停止当前任务，再重新连接" : connectionPairError ?? (modelDiscoveryPhase !== "ready" ? "请先检测地址并获取模型" : modelSelectionInvalid ? "请至少启用并选择一个模型" : apiKeyReentryRequired ? "请重新输入当前连接使用的 API Key" : mcpConfigError ?? (stdioConfirmationMissing ? "请先确认本地程序执行边界" : undefined))} type="button">{connectionBusy ? "正在应用…" : reconnectBlocked ? "任务运行中" : hasWorkspace ? "应用并重新连接" : "应用"}</button></div>
         </footer>
       </section>
     </div>
