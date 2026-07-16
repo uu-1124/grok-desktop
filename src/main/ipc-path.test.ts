@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   connectSchema,
   discoverModelsSchema,
+  droppedFilesSchema,
   identifierSchema,
   IPC_CHANNELS,
   pathSchema,
   permissionModeSchema,
+  themePreferenceSchema,
 } from "./ipc";
 
 describe("IPC path boundary", () => {
@@ -39,6 +41,32 @@ describe("permission mode IPC boundary", () => {
   });
 });
 
+describe("dropped file IPC boundary", () => {
+  it("uses a dedicated channel and validates bounded workspace file lists", () => {
+    expect(IPC_CHANNELS.resolveDroppedFiles).toBe("grok-desktop:resolve-dropped-files");
+    expect(droppedFilesSchema.parse({
+      workspacePath: "D:\\project",
+      filePaths: ["D:\\project\\image.png"],
+    })).toEqual({
+      workspacePath: "D:\\project",
+      filePaths: ["D:\\project\\image.png"],
+    });
+    expect(() => droppedFilesSchema.parse({
+      workspacePath: "D:\\project",
+      filePaths: [],
+    })).toThrow();
+  });
+});
+
+describe("theme preference IPC boundary", () => {
+  it("uses a dedicated typed channel and rejects unknown themes", () => {
+    expect(IPC_CHANNELS.setThemePreference).toBe("grok-desktop:set-theme-preference");
+    expect(themePreferenceSchema.parse("system")).toBe("system");
+    expect(themePreferenceSchema.parse("dark")).toBe("dark");
+    expect(() => themePreferenceSchema.parse("contrast")).toThrow();
+  });
+});
+
 describe("explicit xAI connection IPC boundary", () => {
   const validConnection = {
     workspacePath: "D:\\project",
@@ -59,5 +87,29 @@ describe("explicit xAI connection IPC boundary", () => {
     expect(() => connectSchema.parse(withoutUrl)).toThrow();
     expect(() => discoverModelsSchema.parse(withoutKey)).toThrow();
     expect(() => discoverModelsSchema.parse(withoutUrl)).toThrow();
+  });
+
+  it("accepts a stored credential selector but never both credential sources", () => {
+    const storedConnection = {
+      workspacePath: "D:\\project",
+      xaiApiBaseUrl: "https://gateway.example.com/v1",
+      useStoredXaiApiKey: true as const,
+    };
+    expect(connectSchema.parse(storedConnection)).toEqual(storedConnection);
+    expect(discoverModelsSchema.parse(storedConnection)).toEqual(storedConnection);
+    expect(() => connectSchema.parse({
+      ...validConnection,
+      useStoredXaiApiKey: true,
+    })).toThrow();
+    expect(() => discoverModelsSchema.parse({
+      ...validConnection,
+      useStoredXaiApiKey: true,
+    })).toThrow();
+  });
+
+  it("exposes a dedicated channel for deleting only the encrypted local key", () => {
+    expect(IPC_CHANNELS.clearStoredXaiApiKey).toBe(
+      "grok-desktop:clear-stored-xai-api-key",
+    );
   });
 });

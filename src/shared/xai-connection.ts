@@ -94,6 +94,11 @@ export function isLoopbackXaiApiBaseUrl(value: unknown): boolean {
     isLoopbackHostname(new URL(normalized).hostname);
 }
 
+export function getXaiApiCredentialScope(value: unknown): string | null | undefined {
+  const normalized = normalizeXaiApiBaseUrl(value);
+  return typeof normalized === "string" ? new URL(normalized).origin : normalized;
+}
+
 export function xaiApiBaseUrlCandidates(value: unknown): string[] {
   const normalized = normalizeXaiApiBaseUrl(value);
   if (typeof normalized !== "string") {

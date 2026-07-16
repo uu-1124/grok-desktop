@@ -15,7 +15,8 @@ import type {
   ConnectResult,
   ConnectRequest,
   ContextFileReference,
-  DiscoverModelsRequest,
+  DesktopConnectRequest,
+  DesktopDiscoverModelsRequest,
   DiscoverModelsResult,
   GrokInstallation,
   PermissionResponsePayload,
@@ -26,9 +27,11 @@ import type {
   StoredSession,
   TerminalResizeRequest,
   TerminalStartRequest,
+  ThemePreference,
 } from "../shared/contracts.js";
 import { MAX_PROMPT_CONTEXT_FILES } from "../shared/contracts.js";
 import {
+  getXaiApiCredentialScope,
   normalizeRequiredXaiConnection,
   normalizeXaiApiBaseUrl,
   normalizeXaiApiKey,
@@ -44,8 +47,10 @@ import {
 } from "./xai-model-discovery.js";
 import type { SettingsStore } from "./settings-store.js";
 import type { TerminalManager } from "./terminal-manager.js";
+import type { XaiCredentialStore } from "./xai-credential-store.js";
 import {
   preparePromptContextFiles,
+  preparePromptImages,
   resolveWorkspaceContextFiles,
 } from "./workspace-files.js";
 
@@ -54,11 +59,14 @@ export const IPC_CHANNELS = {
   syncRuntime: "grok-desktop:sync-runtime",
   chooseWorkspace: "grok-desktop:choose-workspace",
   chooseContextFiles: "grok-desktop:choose-context-files",
+  resolveDroppedFiles: "grok-desktop:resolve-dropped-files",
   chooseExecutable: "grok-desktop:choose-executable",
   chooseMcpExecutable: "grok-desktop:choose-mcp-executable",
   discoverModels: "grok-desktop:discover-models",
   setXaiApiBaseUrl: "grok-desktop:set-xai-api-base-url",
   setPermissionMode: "grok-desktop:set-permission-mode",
+  setThemePreference: "grok-desktop:set-theme-preference",
+  clearStoredXaiApiKey: "grok-desktop:clear-stored-xai-api-key",
   connect: "grok-desktop:connect",
   disconnect: "grok-desktop:disconnect",
   createSession: "grok-desktop:create-session",
@@ -88,6 +96,7 @@ const pathSchema = z.string()
 export { pathSchema };
 export const identifierSchema = nonEmptyText(1_024);
 export const permissionModeSchema = z.enum(["default", "auto", "always_approve"]);
+export const themePreferenceSchema = z.enum(["system", "light", "dark"]);
 const xaiApiBaseUrlSchema = z.union([z.string(), z.null()]).transform((value, context) => {
   try {
     return normalizeXaiApiBaseUrl(value) ?? null;
@@ -131,20 +140,30 @@ export const connectSchema = z.strictObject({
   permissionMode: permissionModeSchema.optional(),
   alwaysApprove: z.boolean().optional(),
   xaiApiBaseUrl: requiredXaiApiBaseUrlSchema,
-  xaiApiKey: xaiApiKeySchema,
+  xaiApiKey: xaiApiKeySchema.optional(),
+  useStoredXaiApiKey: z.literal(true).optional(),
   mcpServers: mcpServersSchema.optional(),
   allowStdioMcpExecution: z.literal(true).optional(),
-});
+}).superRefine(requireExactlyOneXaiCredential).transform(
+  (value): DesktopConnectRequest => value as DesktopConnectRequest,
+);
 export const discoverModelsSchema = z.strictObject({
   workspacePath: pathSchema,
   executablePath: pathSchema.optional(),
   xaiApiBaseUrl: requiredXaiApiBaseUrlSchema,
-  xaiApiKey: xaiApiKeySchema,
-});
+  xaiApiKey: xaiApiKeySchema.optional(),
+  useStoredXaiApiKey: z.literal(true).optional(),
+}).superRefine(requireExactlyOneXaiCredential).transform(
+  (value): DesktopDiscoverModelsRequest => value as DesktopDiscoverModelsRequest,
+);
 const promptSchema = z.strictObject({
   sessionId: identifierSchema,
   text: z.string().min(1).max(MAX_PROMPT_LENGTH),
   contextPaths: z.array(pathSchema).max(MAX_PROMPT_CONTEXT_FILES).optional(),
+});
+export const droppedFilesSchema = z.strictObject({
+  workspacePath: pathSchema,
+  filePaths: z.array(pathSchema).min(1).max(MAX_PROMPT_CONTEXT_FILES),
 });
 const permissionResponseSchema = z.strictObject({
   requestId: identifierSchema,
@@ -170,6 +189,8 @@ interface IpcDependencies {
   runtime: GrokRuntime;
   settings: SettingsStore;
   terminal: TerminalManager;
+  credentialStore: XaiCredentialStore;
+  applyThemePreference: (themePreference: ThemePreference) => void;
 }
 
 export function registerIpcHandlers({
@@ -178,10 +199,24 @@ export function registerIpcHandlers({
   runtime,
   settings,
   terminal,
+  credentialStore,
+  applyThemePreference,
 }: IpcDependencies): () => void {
   const registeredChannels: string[] = [];
   let discoveredExecutablePath: string | null = null;
   let modelDiscoveryInProgress = false;
+
+  const resolveXaiCredentials = async (
+    request: DesktopConnectRequest | DesktopDiscoverModelsRequest,
+  ): Promise<{ xaiApiBaseUrl: string; xaiApiKey: string }> => {
+    const apiKey = typeof request.xaiApiKey === "string"
+      ? request.xaiApiKey
+      : await credentialStore.loadForBaseUrl(request.xaiApiBaseUrl);
+    if (!apiKey) {
+      throw new Error("没有找到与当前 API 地址匹配的本机 API Key，请重新输入。");
+    }
+    return normalizeRequiredXaiConnection(request.xaiApiBaseUrl, apiKey);
+  };
 
   const registerNoPayload = <Result>(
     channel: string,
@@ -246,7 +281,10 @@ export function registerIpcHandlers({
 
   registerNoPayload(IPC_CHANNELS.bootstrap, async (): Promise<BootstrapPayload> => {
     const snapshot = settings.getSnapshot();
-    const installation = await discoverGrok(snapshot.grokExecutablePath);
+    const [installation, xaiCredential] = await Promise.all([
+      discoverGrok(snapshot.grokExecutablePath),
+      credentialStore.getStatus(),
+    ]);
     if (installation.found && installation.executablePath) {
       discoveredExecutablePath = installation.executablePath;
     }
@@ -254,6 +292,7 @@ export function registerIpcHandlers({
     return {
       installation,
       settings: snapshot,
+      xaiCredential,
       platform: process.platform,
       appVersion: app.getVersion(),
     };
@@ -313,6 +352,19 @@ export function registerIpcHandlers({
     },
   );
 
+  registerValidated<{ workspacePath: string; filePaths: string[] }, ContextFileReference[]>(
+    IPC_CHANNELS.resolveDroppedFiles,
+    droppedFilesSchema,
+    async ({ workspacePath: requestedWorkspacePath, filePaths }) => {
+      const workspacePath = await requireDirectory(requestedWorkspacePath);
+      const connectedWorkspacePath = runtime.getSnapshot().workspacePath;
+      if (!connectedWorkspacePath || !pathsEqual(connectedWorkspacePath, workspacePath)) {
+        throw new Error("只能向当前连接的 Grok 工作区拖入附件。");
+      }
+      return resolveWorkspaceContextFiles(workspacePath, filePaths);
+    },
+  );
+
   registerNoPayload(
     IPC_CHANNELS.chooseExecutable,
     async (): Promise<GrokInstallation | null> => {
@@ -359,7 +411,7 @@ export function registerIpcHandlers({
     },
   );
 
-  registerValidated<DiscoverModelsRequest, DiscoverModelsResult>(
+  registerValidated<DesktopDiscoverModelsRequest, DiscoverModelsResult>(
     IPC_CHANNELS.discoverModels,
     discoverModelsSchema,
     async (request) => {
@@ -373,10 +425,7 @@ export function registerIpcHandlers({
       try {
         const workspacePath = await requireDirectory(request.workspacePath);
         const installation = await resolveTrustedInstallation(request.executablePath);
-        const credentials = normalizeRequiredXaiConnection(
-          request.xaiApiBaseUrl,
-          request.xaiApiKey,
-        );
+        const credentials = await resolveXaiCredentials(request);
         return await discoverXaiModels(
           () => new GrokRuntime(() => undefined, { connectTimeoutMs: 10_000 }),
           {
@@ -410,7 +459,22 @@ export function registerIpcHandlers({
     },
   );
 
-  registerValidated<ConnectRequest, ConnectResult>(
+  registerValidated<ThemePreference, ThemePreference>(
+    IPC_CHANNELS.setThemePreference,
+    themePreferenceSchema,
+    async (themePreference) => {
+      await settings.setThemePreference(themePreference);
+      applyThemePreference(themePreference);
+      return themePreference;
+    },
+  );
+
+  registerNoPayload(IPC_CHANNELS.clearStoredXaiApiKey, async () => {
+    await credentialStore.clear();
+    return credentialStore.getStatus();
+  });
+
+  registerValidated<DesktopConnectRequest, ConnectResult>(
     IPC_CHANNELS.connect,
     connectSchema,
     async (request) => {
@@ -420,25 +484,26 @@ export function registerIpcHandlers({
       const workspacePath = await requireDirectory(request.workspacePath);
       const installation = await resolveTrustedInstallation(request.executablePath);
       const storedPermissionMode = settings.getSnapshot().permissionMode;
-      const credentials = normalizeRequiredXaiConnection(
-        request.xaiApiBaseUrl,
-        request.xaiApiKey,
-      );
+      const credentials = await resolveXaiCredentials(request);
       const mcpServers = request.mcpServers
         ? await Promise.all(request.mcpServers.map(async (server) => server.type === "stdio"
           ? { ...server, command: await requireMcpExecutablePath(server.command) }
           : server))
         : undefined;
       const normalizedRequest: ConnectRequest = {
-        ...request,
         workspacePath,
         executablePath: installation.executablePath,
+        ...(request.modelId ? { modelId: request.modelId } : {}),
+        ...(request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {}),
         permissionMode: request.permissionMode
           ?? (request.alwaysApprove === undefined
             ? storedPermissionMode
             : request.alwaysApprove ? "always_approve" : "default"),
         ...credentials,
         ...(mcpServers ? { mcpServers } : {}),
+        ...(request.allowStdioMcpExecution
+          ? { allowStdioMcpExecution: request.allowStdioMcpExecution }
+          : {}),
       };
 
       if (normalizedRequest.mcpServers?.some((server) => server.type === "stdio")) {
@@ -472,6 +537,19 @@ export function registerIpcHandlers({
         xaiApiBaseUrlPersisted = false;
         console.warn("Grok Desktop connected, but could not persist the API base URL.");
       }
+      let xaiApiKeyPersisted = request.useStoredXaiApiKey === true;
+      if (typeof request.xaiApiKey === "string") {
+        try {
+          await credentialStore.save(
+            snapshot.xaiApiBaseUrl ?? credentials.xaiApiBaseUrl,
+            credentials.xaiApiKey,
+          );
+          xaiApiKeyPersisted = true;
+        } catch {
+          xaiApiKeyPersisted = false;
+          console.warn("Grok Desktop connected, but could not save the API key securely.");
+        }
+      }
       let permissionModePersisted = true;
       try {
         await settings.setPermissionMode(normalizedRequest.permissionMode ?? "default");
@@ -485,7 +563,18 @@ export function registerIpcHandlers({
           settings.recordWorkspace(workspacePath),
         ]).then(() => undefined),
       );
-      return { snapshot, xaiApiBaseUrlPersisted, permissionModePersisted };
+      const xaiCredential = await credentialStore.getStatus();
+      if (request.useStoredXaiApiKey === true) {
+        xaiApiKeyPersisted = xaiCredential.available &&
+          xaiCredential.scope === getXaiApiCredentialScope(credentials.xaiApiBaseUrl);
+      }
+      return {
+        snapshot,
+        xaiApiBaseUrlPersisted,
+        xaiApiKeyPersisted,
+        xaiCredential,
+        permissionModePersisted,
+      };
     },
   );
 
@@ -540,10 +629,19 @@ export function registerIpcHandlers({
         workspacePath,
         request.contextPaths,
       );
+      const imageReferences = references.filter((reference) => reference.kind === "image");
+      const fileReferences = references.filter((reference) => reference.kind === "file");
+      if (
+        imageReferences.length > 0 &&
+        !runtime.getSnapshot().capabilities.prompt.image
+      ) {
+        throw new Error("当前 Grok 未声明图片输入能力，无法发送图片附件。");
+      }
       const preparedContextFiles = await preparePromptContextFiles(
-        references,
+        fileReferences,
         runtime.getSnapshot().capabilities.prompt.embeddedContext,
       );
+      const preparedImages = await preparePromptImages(imageReferences);
       const currentWorkspacePath = runtime.getSnapshot().workspacePath;
       if (!currentWorkspacePath || !pathsEqual(currentWorkspacePath, workspacePath)) {
         throw new Error("验证上下文文件期间 Grok 工作区发生了变化。");
@@ -551,7 +649,7 @@ export function registerIpcHandlers({
       return runtime.prompt({
         ...request,
         contextPaths: references.map((reference) => reference.path),
-      }, preparedContextFiles);
+      }, preparedContextFiles, preparedImages);
     },
   );
   registerValidated<string, void>(IPC_CHANNELS.cancel, identifierSchema, (sessionId) =>
@@ -612,6 +710,18 @@ export function registerIpcHandlers({
       ipcMain.removeHandler(channel);
     }
   };
+}
+
+function requireExactlyOneXaiCredential(
+  value: { xaiApiKey?: string; useStoredXaiApiKey?: true },
+  context: z.RefinementCtx,
+): void {
+  if ((typeof value.xaiApiKey === "string") === (value.useStoredXaiApiKey === true)) {
+    context.addIssue({
+      code: "custom",
+      message: "Provide either a new API key or the stored API key, but not both.",
+    });
+  }
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent, window: BrowserWindow): void {

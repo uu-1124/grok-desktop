@@ -1,4 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+} from "react";
 import type {
   BootstrapPayload,
   AvailableCommand,
@@ -24,7 +33,9 @@ import type {
   SessionConfigOption,
   SessionReadyPayload,
   StoredSession,
+  ThemePreference,
   TurnOutcome,
+  XaiCredentialStatus,
 } from "../shared/contracts";
 import {
   createEmptyRuntimeCapabilities,
@@ -53,6 +64,7 @@ import {
 import {
   MAX_XAI_API_BASE_URL_LENGTH,
   MAX_XAI_API_KEY_LENGTH,
+  getXaiApiCredentialScope as getSharedXaiApiCredentialScope,
   isLoopbackXaiApiBaseUrl,
   normalizeXaiApiBaseUrl as normalizeSharedXaiApiBaseUrl,
   normalizeXaiApiKey as normalizeSharedXaiApiKey,
@@ -113,6 +125,7 @@ import {
   CopyIcon,
   FileIcon,
   FolderIcon,
+  ImageIcon,
   MenuIcon,
   MoreIcon,
   PanelIcon,
@@ -126,6 +139,7 @@ import {
 import { RichText } from "./components/RichText";
 import { copyTextToClipboard } from "./lib/clipboard";
 import { userFacingErrorMessage } from "./lib/user-facing-error";
+import { resolveTheme } from "./lib/theme";
 
 const TerminalPanel = lazy(async () => {
   const module = await import("./components/TerminalPanel");
@@ -161,6 +175,12 @@ const EMPTY_RUNTIME: RuntimeSnapshot = {
   capabilities: createEmptyRuntimeCapabilities(),
   sessionExecutions: [],
   message: null,
+};
+
+const EMPTY_XAI_CREDENTIAL_STATUS: XaiCredentialStatus = {
+  available: false,
+  scope: null,
+  secureStorageAvailable: false,
 };
 
 const STATUS_COPY: Record<RuntimePhase, string> = {
@@ -224,6 +244,13 @@ export function mergeContextFiles(
     }
   }
   return next;
+}
+
+export function formatAttachmentSize(size: number): string {
+  if (!Number.isFinite(size) || size < 0) return "大小未知";
+  if (size < 1_024) return `${Math.round(size)} B`;
+  if (size < 1_024 * 1_024) return `${(size / 1_024).toFixed(size < 10 * 1_024 ? 1 : 0)} KiB`;
+  return `${(size / 1_024 / 1_024).toFixed(size < 10 * 1_024 * 1_024 ? 1 : 0)} MiB`;
 }
 
 function createEditableMcpServers(
@@ -400,10 +427,14 @@ export function validateXaiApiBaseUrl(value: string): string | null {
   return "URL 不符合安全连接规则";
 }
 
-export function validateXaiConnectionPair(baseUrl: string, apiKey: string): string | null {
+export function validateXaiConnectionPair(
+  baseUrl: string,
+  apiKey: string,
+  storedCredentialAvailable = false,
+): string | null {
   const baseUrlError = validateXaiApiBaseUrl(baseUrl);
   if (baseUrlError) return baseUrlError;
-  if (!apiKey.trim()) return "API Key 必填";
+  if (!apiKey.trim()) return storedCredentialAvailable ? null : "API Key 必填";
   try {
     normalizeSharedXaiApiKey(apiKey);
     return null;
@@ -474,7 +505,7 @@ export function sessionLoadFailureDetail(error: unknown, secret: string): string
 
 export function xaiApiKeyHelpText(baseUrl: string): string {
   void baseUrl;
-  return "URL 与 Key 必须同时提供。Key 仅保存在当前桌面进程并传给本次 Grok 连接，不会写入设置。";
+  return "URL 与 Key 必须同时提供。连接成功后，Key 使用系统安全凭据存储加密，仅绑定当前用户与 API Origin，不写入普通设置。";
 }
 
 export function getXaiApiCredentialScope(
@@ -482,11 +513,19 @@ export function getXaiApiCredentialScope(
 ): string | null | undefined {
   if (!baseUrl.trim()) return null;
   try {
-    const normalized = normalizeSharedXaiApiBaseUrl(baseUrl);
-    return typeof normalized === "string" ? new URL(normalized).origin : null;
+    return getSharedXaiApiCredentialScope(baseUrl);
   } catch {
     return undefined;
   }
+}
+
+export function canUseStoredXaiCredential(
+  baseUrl: string,
+  credential: XaiCredentialStatus,
+): boolean {
+  return credential.available &&
+    credential.scope !== null &&
+    credential.scope === getXaiApiCredentialScope(baseUrl);
 }
 
 export function transitionXaiApiKeyForBaseUrl(
@@ -513,8 +552,11 @@ export function requiresXaiApiKeyReentry(
   runtime: Pick<RuntimeSnapshot, "xaiApiBaseUrl" | "xaiApiKeyConfigured">,
   requestedBaseUrl: string,
   requestedApiKey: string,
+  storedCredentialAvailable = false,
 ): boolean {
-  if (!runtime.xaiApiKeyConfigured || requestedApiKey.trim()) return false;
+  if (!runtime.xaiApiKeyConfigured || requestedApiKey.trim() || storedCredentialAvailable) {
+    return false;
+  }
   return getXaiApiCredentialScope(runtime.xaiApiBaseUrl ?? "") ===
     getXaiApiCredentialScope(requestedBaseUrl);
 }
@@ -559,10 +601,10 @@ export function getXaiConnectionBadge(
     endpointLabel = "自定义 API";
   }
   const keyNotice = runtime.xaiApiKeyConfigured
-    ? "；API Key 仅保存在当前桌面进程"
+    ? "；API Key 已配置且不会进入普通设置或日志"
     : "";
   return {
-    label: `${endpointLabel}${runtime.xaiApiKeyConfigured ? " · 内存 Key" : ""}`,
+    label: `${endpointLabel}${runtime.xaiApiKeyConfigured ? " · Key 已配置" : ""}`,
     title: `当前 API：${endpoint}${keyNotice}。点击打开连接设置。`,
     keyConfigured: runtime.xaiApiKeyConfigured,
   };
@@ -598,6 +640,16 @@ const PERMISSION_MODE_OPTIONS: ReadonlyArray<{
   },
 ];
 
+const THEME_OPTIONS: ReadonlyArray<{
+  id: ThemePreference;
+  label: string;
+  description: string;
+}> = [
+  { id: "system", label: "跟随系统", description: "随 Windows 外观实时切换。" },
+  { id: "light", label: "浅色", description: "始终使用明亮工作台。" },
+  { id: "dark", label: "深色", description: "始终使用低亮度工作台。" },
+];
+
 export function permissionModeLabel(mode: PermissionModePreference): string {
   return PERMISSION_MODE_OPTIONS.find((option) => option.id === mode)?.label ?? "逐项授权";
 }
@@ -609,6 +661,16 @@ export function moveCommandSelection(
 ): number {
   if (commandCount <= 0) return 0;
   return (currentIndex + direction + commandCount) % commandCount;
+}
+
+export function filterAvailableCommands(
+  commands: readonly AvailableCommand[],
+  query: string,
+): AvailableCommand[] {
+  const normalizedQuery = query.trim().toLocaleLowerCase("en-US");
+  return commands.filter((command) =>
+    !normalizedQuery || command.name.toLocaleLowerCase("en-US").includes(normalizedQuery)
+  );
 }
 
 const SESSION_SEARCH_THRESHOLD = 8;
@@ -1107,8 +1169,12 @@ function App() {
   const [settingsTargetWorkspacePath, setSettingsTargetWorkspacePath] = useState<string | null | undefined>(undefined);
   const [workspaceConnectionBusy, setWorkspaceConnectionBusy] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionModePreference>("default");
+  const [themePreference, setThemePreference] = useState<ThemePreference>("system");
   const [xaiApiBaseUrl, setXaiApiBaseUrl] = useState("");
   const [xaiApiKey, setXaiApiKey] = useState("");
+  const [storedXaiCredential, setStoredXaiCredential] = useState<XaiCredentialStatus>(
+    EMPTY_XAI_CREDENTIAL_STATUS,
+  );
   const [modelCatalog, setModelCatalog] = useState<ModelInfo[]>([]);
   const [enabledModelIds, setEnabledModelIds] = useState<string[]>([]);
   const [reconnectModelPreference, setReconnectModelPreference] = useState<{
@@ -1125,6 +1191,8 @@ function App() {
   const [timelineFollowPaused, setTimelineFollowPaused] = useState(false);
   const [replayHistoryIncomplete, setReplayHistoryIncomplete] = useState(false);
   const [baseUrlPersistenceFailed, setBaseUrlPersistenceFailed] = useState(false);
+  const [dropActive, setDropActive] = useState(false);
+  const [dropBusy, setDropBusy] = useState(false);
   const timelineRef = useRef<HTMLDivElement>(null);
   const timelineFollowingRef = useRef(true);
   const noticeCounter = useRef(0);
@@ -1135,6 +1203,19 @@ function App() {
   const rendererSynchronized = useRef(false);
   const railToggleRef = useRef<HTMLButtonElement>(null);
   const inspectorToggleRef = useRef<HTMLButtonElement>(null);
+  const dragDepth = useRef(0);
+
+  useEffect(() => {
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => {
+      const resolved = resolveTheme(themePreference, colorScheme.matches);
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.style.colorScheme = resolved;
+    };
+    apply();
+    colorScheme.addEventListener("change", apply);
+    return () => colorScheme.removeEventListener("change", apply);
+  }, [themePreference]);
 
   const pushNotice = useCallback((message: string, level: NoticeLevel = "info") => {
     const id = ++noticeCounter.current;
@@ -1359,6 +1440,8 @@ function App() {
         if (!alive) return;
         setBootstrap(payload);
         setInstallation(payload.installation);
+        setStoredXaiCredential(payload.xaiCredential);
+        setThemePreference(payload.settings.themePreference);
         setSessions(payload.settings.recentSessions);
         setSessionLoadFailures({});
         const lastWorkspace = payload.settings.lastWorkspacePath;
@@ -1432,9 +1515,15 @@ function App() {
           lastWorkspace
         ) {
           openSettings(lastWorkspace);
+          const storedCredentialAvailable = canUseStoredXaiCredential(
+            configuredBaseUrl,
+            payload.xaiCredential,
+          );
           pushNotice(
             configuredBaseUrl
-              ? "API Base URL 已保留；API Key 不会保存，请重新输入并获取模型后连接。"
+              ? storedCredentialAvailable
+                ? "API Base URL 与本机安全保存的 Key 已恢复，可直接获取模型并连接。"
+                : "API Base URL 已保留；请输入 API Key，获取模型后连接。"
               : "请输入 API Base URL 和 API Key，获取模型后连接项目。",
             "info",
           );
@@ -1508,6 +1597,19 @@ function App() {
     ? executionForSession(runtime, permission.sessionId)?.phase === "cancelling"
     : false;
   const canUseSession = runtime.phase === "ready" || runtime.phase === "working" || runtime.phase === "waiting_permission";
+  const canAcceptDroppedFiles = Boolean(
+    workspacePath &&
+    canUseSession &&
+    mainView === "conversation" &&
+    !settingsOpen &&
+    !permission,
+  );
+
+  useEffect(() => {
+    if (canAcceptDroppedFiles) return;
+    dragDepth.current = 0;
+    setDropActive(false);
+  }, [canAcceptDroppedFiles]);
 
   const workspaceSessions = useMemo(() => sessions
     .filter((session) => !workspacePath || session.workspacePath === workspacePath)
@@ -1558,6 +1660,10 @@ function App() {
     if (!path || workspaceConnectionBusyRef.current) return null;
     const requestedBaseUrl = settings ? settings.baseUrl : xaiApiBaseUrl;
     const requestedApiKey = normalizeXaiApiKey(settings ? settings.apiKey : xaiApiKey);
+    const storedCredentialAvailable = canUseStoredXaiCredential(
+      requestedBaseUrl,
+      storedXaiCredential,
+    );
     const requestedPermissionMode = resolveRequestedPermissionMode(
       permissionMode,
       settings,
@@ -1571,14 +1677,23 @@ function App() {
       openSettings(path);
       return null;
     }
-    const connectionError = validateXaiConnectionPair(requestedBaseUrl, requestedApiKey);
+    const connectionError = validateXaiConnectionPair(
+      requestedBaseUrl,
+      requestedApiKey,
+      storedCredentialAvailable,
+    );
     if (connectionError) {
       pushNotice(`连接设置无效：${connectionError}`, "warning");
       openSettings(path);
       return null;
     }
-    if (requiresXaiApiKeyReentry(runtime, requestedBaseUrl, requestedApiKey)) {
-      pushNotice("当前连接的 API Key 仅保存在内存中；重新连接前请在设置中重新输入。", "warning");
+    if (requiresXaiApiKeyReentry(
+      runtime,
+      requestedBaseUrl,
+      requestedApiKey,
+      storedCredentialAvailable,
+    )) {
+      pushNotice("当前连接的 API Key 未保存在系统安全凭据库中；重新连接前请在设置中重新输入。", "warning");
       openSettings(path);
       return null;
     }
@@ -1618,7 +1733,9 @@ function App() {
         ...requestedModel,
         permissionMode: requestedPermissionMode,
         xaiApiBaseUrl: normalizeXaiApiBaseUrl(requestedBaseUrl),
-        xaiApiKey: requestedApiKey,
+        ...(requestedApiKey
+          ? { xaiApiKey: requestedApiKey }
+          : { useStoredXaiApiKey: true as const }),
         ...(normalizedMcpServers.length > 0 ? { mcpServers: normalizedMcpServers } : {}),
         ...(settings?.allowStdioMcpExecution ? { allowStdioMcpExecution: true as const } : {}),
       });
@@ -1643,11 +1760,15 @@ function App() {
       acceptRuntimeSnapshot(snapshot);
       if (snapshot.xaiApiBaseUrl) setXaiApiBaseUrl(snapshot.xaiApiBaseUrl);
       setBaseUrlPersistenceFailed(!result.xaiApiBaseUrlPersisted);
+      setStoredXaiCredential(result.xaiCredential);
       if (!result.xaiApiBaseUrlPersisted) {
         pushNotice("已连接，但 API Base URL 无法写入磁盘；重启后需要重新设置。", "warning");
       }
       if (!result.permissionModePersisted) {
         pushNotice("已连接，但权限模式无法写入磁盘；重启后将恢复逐项授权。", "warning");
+      }
+      if (!result.xaiApiKeyPersisted) {
+        pushNotice("已连接，但 API Key 无法写入系统安全凭据库；应用退出后需要重新输入。", "warning");
       }
       setContextFileDrafts({});
       setRailOpen(false);
@@ -1675,6 +1796,7 @@ function App() {
     runtime,
     reconnectModelPreference,
     workspaceMcpConfigs,
+    storedXaiCredential,
     xaiApiBaseUrl,
     xaiApiKey,
   ]);
@@ -1697,6 +1819,21 @@ function App() {
     setPermissionMode(nextMode);
     pushNotice(`已切换为${permissionModeLabel(nextMode)}`);
   }, [anyTaskBusy, connectWorkspace, permissionMode, pushNotice, runtime.permissionMode, workspacePath]);
+
+  const changeTheme = useCallback(async (nextTheme: ThemePreference): Promise<boolean> => {
+    if (nextTheme === themePreference) return true;
+    const previousTheme = themePreference;
+    setThemePreference(nextTheme);
+    try {
+      const saved = await window.grokDesktop.setThemePreference(nextTheme);
+      setThemePreference(saved);
+      return true;
+    } catch (error) {
+      setThemePreference(previousTheme);
+      pushNotice(userFacingErrorMessage(error, "外观设置保存失败"), "error");
+      return false;
+    }
+  }, [pushNotice, themePreference]);
 
   const toggleTerminal = useCallback(async () => {
     if (!workspacePath || anyTaskBusy || terminalSwitchBusy || workspaceConnectionBusyRef.current) return;
@@ -1751,6 +1888,7 @@ function App() {
         const connectionError = validateXaiConnectionPair(
           normalizedSettings.baseUrl,
           normalizedSettings.apiKey,
+          canUseStoredXaiCredential(normalizedSettings.baseUrl, storedXaiCredential),
         );
         if (connectionError) throw new Error(connectionError);
         const savedBaseUrl = await window.grokDesktop.setXaiApiBaseUrl(normalizedBaseUrl);
@@ -1793,7 +1931,19 @@ function App() {
       );
       return false;
     }
-  }, [connectWorkspace, pushNotice]);
+  }, [connectWorkspace, pushNotice, storedXaiCredential]);
+
+  const clearStoredXaiApiKey = useCallback(async (): Promise<boolean> => {
+    try {
+      const status = await window.grokDesktop.clearStoredXaiApiKey();
+      setStoredXaiCredential(status);
+      pushNotice("本机安全凭据库中的 API Key 已清除。", "info");
+      return true;
+    } catch (error) {
+      pushNotice(userFacingErrorMessage(error, "无法清除本机 API Key"), "error");
+      return false;
+    }
+  }, [pushNotice]);
 
   const disconnectFromSettings = useCallback(async () => {
     const releaseConnection = acquireWorkspaceConnection();
@@ -1983,12 +2133,110 @@ function App() {
     try {
       const selected = await window.grokDesktop.chooseContextFiles(workspacePath);
       if (selected.length > 0) {
-        setContextFiles((current) => mergeContextFiles(current, selected));
+        const unsupportedImages = selected.filter((file) =>
+          file.kind === "image" && !runtime.capabilities.prompt.image
+        );
+        const accepted = selected.filter((file) =>
+          file.kind !== "image" || runtime.capabilities.prompt.image
+        );
+        if (unsupportedImages.length > 0) {
+          pushNotice(
+            `当前 Grok 未声明图片输入能力，已忽略 ${unsupportedImages.length} 张图片。`,
+            "warning",
+          );
+        }
+        if (accepted.length > 0) {
+          setContextFiles((current) => mergeContextFiles(current, accepted));
+        }
       }
     } catch (error) {
       pushNotice(userFacingErrorMessage(error, "无法引用工作区文件"), "error");
     }
-  }, [canUseSession, pushNotice, setContextFiles, workspacePath]);
+  }, [canUseSession, pushNotice, runtime.capabilities.prompt.image, setContextFiles, workspacePath]);
+
+  const handleFileDragEnter = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    if (canAcceptDroppedFiles) setDropActive(true);
+  }, [canAcceptDroppedFiles]);
+
+  const handleFileDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = canAcceptDroppedFiles ? "copy" : "none";
+  }, [canAcceptDroppedFiles]);
+
+  const handleFileDragLeave = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropActive(false);
+  }, []);
+
+  const handleFileDrop = useCallback(async (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDropActive(false);
+
+    if (!workspacePath) {
+      pushNotice("请先连接一个工作区，再拖入附件。", "warning");
+      return;
+    }
+    if (mainView !== "conversation") {
+      pushNotice("请先返回结构化任务，再拖入文件或图片。", "warning");
+      return;
+    }
+    if (settingsOpen || permission) {
+      pushNotice("请先完成当前弹窗操作，再拖入附件。", "warning");
+      return;
+    }
+    if (!canUseSession) {
+      pushNotice("Grok 连接尚未就绪，暂时不能添加附件。", "warning");
+      return;
+    }
+
+    const droppedFiles = Array.from(event.dataTransfer.files);
+    if (droppedFiles.length === 0) return;
+    if (droppedFiles.length > MAX_PROMPT_CONTEXT_FILES) {
+      pushNotice(`一次最多拖入 ${MAX_PROMPT_CONTEXT_FILES} 个附件。`, "warning");
+      return;
+    }
+
+    setDropBusy(true);
+    setDropActive(true);
+    try {
+      const filePaths = [...new Set(droppedFiles.map((file) =>
+        window.grokDesktop.getPathForDroppedFile(file)
+      ).filter(Boolean))];
+      if (filePaths.length === 0) {
+        throw new Error("拖入的内容不是可读取的本地文件。");
+      }
+      const resolved = await window.grokDesktop.resolveDroppedFiles(workspacePath, filePaths);
+      const unsupportedImages = resolved.filter((file) =>
+        file.kind === "image" && !runtime.capabilities.prompt.image
+      );
+      const accepted = resolved.filter((file) =>
+        file.kind !== "image" || runtime.capabilities.prompt.image
+      );
+      if (unsupportedImages.length > 0) {
+        pushNotice(
+          `当前 Grok 未声明图片输入能力，已忽略 ${unsupportedImages.length} 张图片。`,
+          "warning",
+        );
+      }
+      if (accepted.length > 0) {
+        setContextFiles((current) => mergeContextFiles(current, accepted));
+        pushNotice(`已添加 ${accepted.length} 个附件。`);
+      }
+    } catch (error) {
+      pushNotice(userFacingErrorMessage(error, "无法添加拖入的附件"), "error");
+    } finally {
+      setDropBusy(false);
+      setDropActive(false);
+    }
+  }, [canUseSession, mainView, permission, pushNotice, runtime.capabilities.prompt.image, setContextFiles, settingsOpen, workspacePath]);
 
   const submitPrompt = useCallback(async (textOverride?: string) => {
     const text = (textOverride ?? composer).trim();
@@ -2104,8 +2352,12 @@ function App() {
       await changeConfig(control.configId, modelId);
       return;
     }
-    if (!workspacePath || !xaiApiBaseUrl || !xaiApiKey) {
-      pushNotice("切换进程模型需要当前 URL 和内存 API Key，请在设置中重新输入。", "warning");
+    if (
+      !workspacePath ||
+      !xaiApiBaseUrl ||
+      (!xaiApiKey && !canUseStoredXaiCredential(xaiApiBaseUrl, storedXaiCredential))
+    ) {
+      pushNotice("切换进程模型需要当前 URL 和可用 API Key，请在设置中重新输入。", "warning");
       openSettings(workspacePath);
       return;
     }
@@ -2177,7 +2429,14 @@ function App() {
   const connectionMissing = !installation?.found;
 
   return (
-    <div className="app" data-phase={runtime.phase}>
+    <div
+      className="app"
+      data-phase={runtime.phase}
+      onDragEnter={handleFileDragEnter}
+      onDragLeave={handleFileDragLeave}
+      onDragOver={handleFileDragOver}
+      onDrop={(event) => void handleFileDrop(event)}
+    >
       <header className="app-topbar">
         <div className="app-topbar__content">
           <div className="app-topbar__leading">
@@ -2288,9 +2547,20 @@ function App() {
         />
       </div>
 
+      {(dropActive || dropBusy) && (
+        <div aria-live="polite" className="drop-plane" role="status">
+          <div className="drop-plane__content">
+            <span><ImageIcon size={24}/><FileIcon size={21}/></span>
+            <strong>{dropBusy ? "正在验证附件" : "释放以添加到当前任务"}</strong>
+            <small>图片将作为视觉输入，其他文件将作为工作区上下文</small>
+          </div>
+        </div>
+      )}
+
       {settingsOpen && (
         <SettingsModal
           permissionMode={permissionMode}
+          themePreference={themePreference}
           bootstrap={bootstrap!}
           key={workspaceMcpConfigKey(settingsWorkspacePath, platform) ?? "global-settings"}
           installation={installation}
@@ -2300,6 +2570,8 @@ function App() {
           onChooseExecutable={() => void chooseExecutable()}
           onClose={closeSettings}
           onDisconnect={() => void disconnectFromSettings()}
+          onClearStoredXaiApiKey={clearStoredXaiApiKey}
+          onChangeTheme={changeTheme}
           onApplyConnectionSettings={applyConnectionSettings}
           runtime={runtime}
           mcpServers={settingsMcpServers}
@@ -2307,6 +2579,7 @@ function App() {
           workspacePath={settingsWorkspacePath}
           xaiApiBaseUrl={xaiApiBaseUrl}
           xaiApiKey={xaiApiKey}
+          storedXaiCredential={storedXaiCredential}
         />
       )}
       {permission && permissionSource && <PermissionModal busy={permissionBusy} frozen={permissionFrozen} isCurrentTask={permissionSource.isCurrentTask} onResolve={(optionId) => void resolvePermission(optionId)} permission={permission} queueLength={permissions.length} taskTitle={permissionSource.taskTitle} workspacePath={permissionSource.workspacePath} />}
@@ -2684,13 +2957,12 @@ function ConversationStage(props: ConversationStageProps) {
   const isCancelling = execution?.phase === "cancelling";
   const [commandIndex, setCommandIndex] = useState(0);
   const [commandMenuDismissed, setCommandMenuDismissed] = useState(false);
+  const commandMenuRef = useRef<HTMLDivElement>(null);
   const timeline = currentView?.timeline ?? [];
   const commands = currentView?.availableCommands ?? activeSession?.availableCommands ?? [];
   const commandMatch = props.composer.match(/^\/(\S*)$/);
   const commandQuery = commandMatch?.[1]?.toLocaleLowerCase("en-US") ?? "";
-  const visibleCommands = commands.filter((command) =>
-    !commandQuery || command.name.toLocaleLowerCase("en-US").includes(commandQuery),
-  ).slice(0, 8);
+  const visibleCommands = filterAvailableCommands(commands, commandQuery);
   const commandMenuOpen = Boolean(commandMatch) &&
     visibleCommands.length > 0 &&
     !commandMenuDismissed;
@@ -2703,6 +2975,12 @@ function ConversationStage(props: ConversationStageProps) {
     setCommandIndex(0);
     setCommandMenuDismissed(false);
   }, [commandQuery, activeSession?.sessionId]);
+  useEffect(() => {
+    if (!commandMenuOpen) return;
+    commandMenuRef.current
+      ?.querySelector<HTMLElement>(`[data-command-index="${selectedCommandIndex}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [commandMenuOpen, selectedCommandIndex]);
   const outcome = currentView?.turnOutcome ?? executionTurnOutcome(execution);
   const outcomePresentation = outcome ? turnOutcomePresentation(outcome) : null;
   const visibleOutcomePresentation = isWorking ? null : outcomePresentation;
@@ -2756,17 +3034,17 @@ function ConversationStage(props: ConversationStageProps) {
         {props.showScrollToLatest && <button aria-label="回到最新消息" className="timeline-jump" onClick={props.onScrollToLatest} title="回到最新消息" type="button"><ChevronIcon size={16}/></button>}
         <div className={`composer${isWorking ? " is-working" : ""}`}>
           {props.contextFiles.length > 0 && (
-            <div className="composer-context" aria-label="已引用的工作区文件">
+            <div className="composer-context" aria-label="已添加的附件">
               {props.contextFiles.map((file) => (
-                <span className="composer-context__file" key={file.path} title={file.path}>
-                  <FileIcon size={13}/>
-                  <span>{file.relativePath}</span>
+                <span className={`composer-context__file${file.kind === "image" ? " is-image" : ""}`} key={file.path} title={file.path}>
+                  {file.kind === "image" ? <ImageIcon size={13}/> : <FileIcon size={13}/>}
+                  <span><strong>{file.relativePath}</strong><small>{file.kind === "image" ? "图片" : "上下文文件"} · {formatAttachmentSize(file.size)}</small></span>
                   <button aria-label={`移除 ${file.relativePath}`} onClick={() => props.onRemoveContextFile(file.path)} type="button"><CloseIcon size={12}/></button>
                 </span>
               ))}
             </div>
           )}
-          <button aria-label="引用工作区文件" className="composer__attach" disabled={!canUseSession} onClick={props.onAttachContextFiles} title="引用工作区文件；内容仅随本次请求发送" type="button"><PlusIcon size={17}/></button>
+          <button aria-label="添加文件或图片" className="composer__attach" disabled={!canUseSession} onClick={props.onAttachContextFiles} title="选择或拖入工作区文件；附件仅随本次请求发送" type="button"><PlusIcon size={17}/></button>
           <textarea
             aria-activedescendant={commandMenuOpen ? `composer-command-${selectedCommandIndex}` : undefined}
             aria-controls={commandMenuOpen ? "composer-command-menu" : undefined}
@@ -2812,10 +3090,10 @@ function ConversationStage(props: ConversationStageProps) {
             value={props.composer}
           />
           {commandMenuOpen && (
-            <div className="composer-commands" id="composer-command-menu" role="listbox" aria-label="Grok 命令">
-              <div className="composer-commands__heading"><span>命令</span><small>选择后继续补充参数</small></div>
+            <div className="composer-commands" id="composer-command-menu" ref={commandMenuRef} role="listbox" aria-label="Grok 命令">
+              <div className="composer-commands__heading"><span>命令</span><small>{visibleCommands.length} 个 · 输入名称可筛选</small></div>
               {visibleCommands.map((command, index) => (
-                <button aria-selected={index === selectedCommandIndex} className={`composer-command${index === selectedCommandIndex ? " is-selected" : ""}`} id={`composer-command-${index}`} key={command.name} onMouseDown={(event) => event.preventDefault()} onClick={() => selectCommand(command)} role="option" type="button">
+                <button aria-posinset={index + 1} aria-selected={index === selectedCommandIndex} aria-setsize={visibleCommands.length} className={`composer-command${index === selectedCommandIndex ? " is-selected" : ""}`} data-command-index={index} id={`composer-command-${index}`} key={command.name} onMouseDown={(event) => event.preventDefault()} onClick={() => selectCommand(command)} role="option" type="button">
                   <strong>/{command.name}</strong><span>{command.description || "无描述"}</span>{command.inputHint && <small>{command.inputHint}</small>}
                 </button>
               ))}
@@ -2823,7 +3101,7 @@ function ConversationStage(props: ConversationStageProps) {
           )}
           {isWorking ? <button aria-busy={isCancelling} aria-label={isCancelling ? "正在停止执行" : "停止执行"} className="composer__action composer__action--stop" disabled={isCancelling} onClick={props.onCancel} title={isCancelling ? "正在等待 Grok 确认停止" : "停止执行"} type="button"><StopIcon size={16}/></button> : <button className="composer__action" aria-label="发送" disabled={!props.composer.trim() || !canUseSession} onClick={props.onSubmit} type="button"><ArrowUpIcon size={17}/></button>}
         </div>
-        <div className="composer-meta">{modelControl ? <label className="composer-model-select" title={modelControl.strategy === "session" ? "切换当前会话模型" : "切换后会重新连接，历史任务仍保留"}><span>模型</span><select aria-label="当前模型" disabled={isWorking || props.connectionBusy || props.modelBusy || props.reconnectBlocked} onChange={(event) => props.onChangeModel(event.target.value)} value={modelControl.currentModelId}>{modelControl.models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label> : <span>{modelLabel}</span>}{connectionBadge && <button className="composer-connection" data-key-configured={connectionBadge.keyConfigured} onClick={props.onOpenConnectionSettings} title={connectionBadge.title} type="button"><i/>{connectionBadge.label}</button>}<PermissionModeControl disabled={props.connectionBusy || props.reconnectBlocked} mode={runtime.permissionMode ?? props.permissionMode} onChange={props.onChangePermissionMode}/><span className="composer-shortcut">Enter 发送 · Shift+Enter 换行</span>{props.contextFiles.length > 0 && <span>{props.contextFiles.length} 个文件</span>}<UsageDisclosure view={currentView}/></div>
+        <div className="composer-meta">{modelControl ? <label className="composer-model-select" title={modelControl.strategy === "session" ? "切换当前会话模型" : "切换后会重新连接，历史任务仍保留"}><span>模型</span><select aria-label="当前模型" disabled={isWorking || props.connectionBusy || props.modelBusy || props.reconnectBlocked} onChange={(event) => props.onChangeModel(event.target.value)} value={modelControl.currentModelId}>{modelControl.models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label> : <span>{modelLabel}</span>}{connectionBadge && <button className="composer-connection" data-key-configured={connectionBadge.keyConfigured} onClick={props.onOpenConnectionSettings} title={connectionBadge.title} type="button"><i/>{connectionBadge.label}</button>}<PermissionModeControl disabled={props.connectionBusy || props.reconnectBlocked} mode={runtime.permissionMode ?? props.permissionMode} onChange={props.onChangePermissionMode}/><span className="composer-shortcut">Enter 发送 · Shift+Enter 换行</span>{props.contextFiles.length > 0 && <span>{props.contextFiles.length} 个附件</span>}<UsageDisclosure view={currentView}/></div>
       </div>
     </section>
   );
@@ -3262,11 +3540,15 @@ interface SettingsModalProps {
   runtime: RuntimeSnapshot;
   taskBusy: boolean;
   permissionMode: PermissionModePreference;
+  themePreference: ThemePreference;
+  storedXaiCredential: XaiCredentialStatus;
   xaiApiBaseUrl: string;
   xaiApiKey: string;
   mcpServers: McpServerConfig[];
   workspacePath: string | null;
   onChooseExecutable(): void;
+  onClearStoredXaiApiKey(): Promise<boolean>;
+  onChangeTheme(themePreference: ThemePreference): Promise<boolean>;
   onDisconnect(): void;
   onApplyConnectionSettings(
     workspacePath: string | null,
@@ -3284,11 +3566,15 @@ function SettingsModal({
   runtime,
   taskBusy,
   permissionMode,
+  themePreference,
+  storedXaiCredential,
   xaiApiBaseUrl,
   xaiApiKey,
   mcpServers,
   workspacePath,
   onChooseExecutable,
+  onClearStoredXaiApiKey,
+  onChangeTheme,
   onDisconnect,
   onApplyConnectionSettings,
   onClose,
@@ -3331,9 +3617,19 @@ function SettingsModal({
     preferredReasoningEffort(initialModels, runtime.currentModelId),
   );
   const [showApiKey, setShowApiKey] = useState(false);
+  const [themeBusy, setThemeBusy] = useState(false);
+  const [credentialBusy, setCredentialBusy] = useState(false);
   const baseUrlError = validateXaiApiBaseUrl(draftBaseUrl);
   const baseUrlAdvisory = baseUrlError ? null : xaiApiBaseUrlAdvisory(draftBaseUrl);
-  const connectionPairError = validateXaiConnectionPair(draftBaseUrl, draftApiKey);
+  const storedCredentialAvailable = canUseStoredXaiCredential(
+    draftBaseUrl,
+    storedXaiCredential,
+  );
+  const connectionPairError = validateXaiConnectionPair(
+    draftBaseUrl,
+    draftApiKey,
+    storedCredentialAvailable,
+  );
   const capabilitiesAuthoritative = runtimeCapabilitiesApplyToExecutable(
     runtime,
     installation?.executablePath,
@@ -3380,12 +3676,17 @@ function SettingsModal({
     runtime,
     draftBaseUrl,
     draftApiKey,
+    storedCredentialAvailable,
   );
   const apiKeyDescription = [
     "xai-api-key-help",
     draftApiKey ? "xai-api-key-cli-mcp-notice" : null,
     apiKeyTargetInvalid ? "xai-api-key-target-notice" : null,
     apiKeyClearedForEndpointChange ? "xai-api-key-scope-notice" : null,
+    storedCredentialAvailable && !draftApiKey ? "xai-api-key-stored-notice" : null,
+    storedXaiCredential.available && !storedCredentialAvailable
+      ? "xai-api-key-other-scope-notice"
+      : null,
     apiKeyReentryRequired ? "xai-api-key-reentry-notice" : null,
   ].filter(Boolean).join(" ");
 
@@ -3463,7 +3764,11 @@ function SettingsModal({
   };
 
   const discoverModels = async () => {
-    const validationError = validateXaiConnectionPair(draftBaseUrl, draftApiKey);
+    const validationError = validateXaiConnectionPair(
+      draftBaseUrl,
+      draftApiKey,
+      storedCredentialAvailable,
+    );
     if (validationError || !workspacePath || !installation?.executablePath || connectionBusy) {
       setModelDiscoveryPhase("error");
       setModelDiscoveryMessage(
@@ -3482,7 +3787,9 @@ function SettingsModal({
         workspacePath,
         executablePath: installation.executablePath,
         xaiApiBaseUrl: normalizeXaiApiBaseUrl(draftBaseUrl),
-        xaiApiKey: normalizeXaiApiKey(draftApiKey),
+        ...(draftApiKey.trim()
+          ? { xaiApiKey: normalizeXaiApiKey(draftApiKey) }
+          : { useStoredXaiApiKey: true as const }),
       });
       if (revision !== modelDiscoveryRevision.current) return;
       const models = result.models.map((model) => ({ ...model }));
@@ -3710,6 +4017,28 @@ function SettingsModal({
     if (applied) onClose();
   };
 
+  const changeThemePreference = async (nextTheme: ThemePreference) => {
+    if (themeBusy || nextTheme === themePreference) return;
+    setThemeBusy(true);
+    try {
+      await onChangeTheme(nextTheme);
+    } finally {
+      setThemeBusy(false);
+    }
+  };
+
+  const clearApiKey = async () => {
+    if (credentialBusy) return;
+    if (draftApiKey) changeApiKey("");
+    if (!storedXaiCredential.available) return;
+    setCredentialBusy(true);
+    try {
+      await onClearStoredXaiApiKey();
+    } finally {
+      setCredentialBusy(false);
+    }
+  };
+
   const requestClose = () => {
     if (!connectionBusy) onClose();
   };
@@ -3723,11 +4052,31 @@ function SettingsModal({
     <div className="modal-layer settings-layer" role="presentation">
       <section aria-labelledby="settings-title" aria-modal="true" className="modal settings-modal" ref={dialogRef} role="dialog" tabIndex={-1}>
         <header>
-          <div><p className="eyebrow">Grok Desktop</p><h2 id="settings-title">设置</h2><span>管理本地运行时、xAI 连接、MCP 和授权策略。</span></div>
+          <div><p className="eyebrow">Grok Desktop</p><h2 id="settings-title">设置</h2><span>管理外观、本地运行时、xAI 连接、MCP 和授权策略。</span></div>
           <button className="icon-button" aria-label="关闭设置" disabled={connectionBusy} onClick={requestClose} type="button"><CloseIcon/></button>
         </header>
 
         <div className="settings-scroll">
+          <section className="settings-group" aria-labelledby="appearance-settings-title">
+            <div className="settings-group__heading"><h3 id="appearance-settings-title">外观</h3><p>主题会同步应用到工作台、弹窗和 Windows 标题栏。</p></div>
+            <div aria-label="应用外观" className="appearance-settings" role="radiogroup">
+              {THEME_OPTIONS.map((option) => (
+                <button
+                  aria-checked={themePreference === option.id}
+                  className={themePreference === option.id ? "is-selected" : ""}
+                  disabled={themeBusy}
+                  key={option.id}
+                  onClick={() => void changeThemePreference(option.id)}
+                  role="radio"
+                  type="button"
+                >
+                  <span aria-hidden="true" className={`theme-swatch theme-swatch--${option.id}`}><i/><b/></span>
+                  <span><strong>{option.label}</strong><small>{option.description}</small></span>
+                </button>
+              ))}
+            </div>
+          </section>
+
           <section className="settings-group" aria-labelledby="runtime-settings-title">
             <div className="settings-group__heading"><h3 id="runtime-settings-title">本地运行时</h3><p>桌面端直接启动你电脑上现有的 Grok CLI。</p></div>
             <div className="executable-row">
@@ -3738,7 +4087,7 @@ function SettingsModal({
           </section>
 
           <section className="settings-group" aria-labelledby="connection-settings-title">
-            <div className="settings-group__heading"><h3 id="connection-settings-title">API 连接</h3><p>结构化连接只支持用户明确提供的 URL + API Key。远程地址必须使用 HTTPS，本机开发服务可使用 HTTP。</p></div>
+            <div className="settings-group__heading"><h3 id="connection-settings-title">API 连接</h3><p>结构化连接只使用用户明确提供的 URL + API Key。连接成功后，Key 由当前用户的系统安全凭据库加密保存。</p></div>
             <div className="settings-field">
               <label htmlFor="xai-api-base-url">API Base URL</label>
               <input
@@ -3768,23 +4117,35 @@ function SettingsModal({
                   aria-describedby={apiKeyDescription}
                   autoCapitalize="none"
                   autoComplete="new-password"
-                  disabled={connectionBusy || apiKeyTargetInvalid}
+                  disabled={connectionBusy || credentialBusy || apiKeyTargetInvalid}
                   id="xai-api-key"
                   maxLength={MAX_XAI_API_KEY_LENGTH}
                   onChange={(event) => changeApiKey(event.target.value)}
-                  placeholder="输入本次运行使用的 API Key"
+                  placeholder={storedCredentialAvailable
+                    ? "已使用本机安全保存的 API Key"
+                    : "输入 API Key"}
                   spellCheck={false}
                   type={showApiKey ? "text" : "password"}
                   value={draftApiKey}
                 />
-                <button aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"} aria-pressed={showApiKey} disabled={connectionBusy || apiKeyTargetInvalid || !draftApiKey} onClick={() => setShowApiKey((visible) => !visible)} type="button">{showApiKey ? "隐藏" : "显示"}</button>
-                <button aria-label="清除 API Key" disabled={connectionBusy || !draftApiKey} onClick={() => changeApiKey("")} type="button">清除</button>
+                <button aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"} aria-pressed={showApiKey} disabled={connectionBusy || credentialBusy || apiKeyTargetInvalid || !draftApiKey} onClick={() => setShowApiKey((visible) => !visible)} type="button">{showApiKey ? "隐藏" : "显示"}</button>
+                <button
+                  aria-label={storedXaiCredential.available
+                    ? "清除输入并删除本机保存的 API Key"
+                    : "清除输入的 API Key"}
+                  disabled={connectionBusy || credentialBusy || (!draftApiKey && !storedXaiCredential.available)}
+                  onClick={() => void clearApiKey()}
+                  type="button"
+                >{credentialBusy ? "清除中…" : storedXaiCredential.available ? "清除本机 Key" : "清除输入"}</button>
               </div>
               <small id="xai-api-key-help">{apiKeyHelp}</small>
               {draftApiKey && <small className="settings-field__notice" id="xai-api-key-cli-mcp-notice" role="note">桌面端只隔离本页注入的 stdio MCP；Grok CLI 自行管理的 MCP 属于外部 Grok 配置，可能继承 Grok 进程环境中的本次 Key。</small>}
+              {storedCredentialAvailable && !draftApiKey && <small className="settings-field__notice" id="xai-api-key-stored-notice" role="status">已找到由当前系统用户安全保存、并与此 API Origin 匹配的 Key。明文不会显示或返回 Renderer。</small>}
+              {storedXaiCredential.available && !storedCredentialAvailable && <small className="settings-field__notice" id="xai-api-key-other-scope-notice" role="status">本机保存的 Key 绑定到 {storedXaiCredential.scope}，不能用于当前 API 地址。</small>}
+              {!storedXaiCredential.secureStorageAvailable && <small className="settings-field__notice" role="status">当前系统安全凭据存储不可用；Key 只会保留到应用退出。</small>}
               {apiKeyTargetInvalid && <small className="settings-field__notice" id="xai-api-key-target-notice" role="status">先输入有效的 API Base URL，再绑定 API Key。</small>}
               {apiKeyClearedForEndpointChange && <small className="settings-field__notice" id="xai-api-key-scope-notice" role="status">旧 API Key 已从设置草稿移除；应用并重新连接后将停止使用原凭据。</small>}
-              {apiKeyReentryRequired && <small className="settings-field__notice" id="xai-api-key-reentry-notice" role="status">当前 Grok 连接仍在使用只存在于主进程内存中的 API Key。重新连接前必须再次输入。</small>}
+              {apiKeyReentryRequired && <small className="settings-field__notice" id="xai-api-key-reentry-notice" role="status">当前 Grok 连接仍在使用未保存到系统安全凭据库的 API Key。重新连接前必须再次输入。</small>}
             </div>
 
             <div className="model-discovery-actions">
@@ -3797,7 +4158,7 @@ function SettingsModal({
               >
                 {modelDiscoveryPhase === "loading" ? "正在检测…" : "检测地址并获取模型"}
               </button>
-              <small>不会读取或保存外部 CLI 身份状态；API Key 只传给短生命周期 ACP 进程。</small>
+              <small>不会读取外部 CLI 身份状态；Key 仅在 Main 解密后传给短生命周期 ACP 进程。</small>
             </div>
             {modelDiscoveryMessage && (
               <div

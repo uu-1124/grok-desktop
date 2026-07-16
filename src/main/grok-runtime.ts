@@ -71,10 +71,13 @@ import {
   parseReportedMcpServerCount,
   parseSessionCapabilities,
 } from "./acp-capabilities.js";
-import type { PreparedPromptContextFile } from "./workspace-files.js";
+import type {
+  PreparedPromptContextFile,
+  PreparedPromptImage,
+} from "./workspace-files.js";
 
 const CLIENT_NAME = "Grok Desktop";
-const CLIENT_VERSION = "0.1.3";
+const CLIENT_VERSION = "0.1.4";
 const CONNECT_TIMEOUT_MS = 20_000;
 const SPAWN_TIMEOUT_MS = 5_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
@@ -576,6 +579,7 @@ export class GrokRuntime {
   async prompt(
     request: PromptRequest,
     preparedContextFiles: readonly PreparedPromptContextFile[] = [],
+    preparedImages: readonly PreparedPromptImage[] = [],
   ): Promise<void> {
     const normalized = normalizePromptRequest(request, this.requireWorkspacePath());
     const agent = this.requireAgent();
@@ -617,6 +621,7 @@ export class GrokRuntime {
         ...createPromptContextBlocks(
           normalized.contextPaths ?? [],
           preparedContextFiles,
+          preparedImages,
           this.snapshot.capabilities.prompt.embeddedContext,
         ),
       ];
@@ -1476,6 +1481,13 @@ function sanitizePromptEchoContent(value: unknown): unknown {
     return value.map(sanitizePromptEchoContent);
   }
   const content = asRecord(value);
+  if (content?.type === "image") {
+    return {
+      type: "image",
+      ...(typeof content.mimeType === "string" ? { mimeType: content.mimeType } : {}),
+      ...(typeof content.uri === "string" ? { uri: content.uri } : {}),
+    };
+  }
   if (content?.type !== "resource") {
     return cloneSerializable(value);
   }
@@ -1874,10 +1886,12 @@ function normalizePromptContextPaths(
 function createPromptContextBlocks(
   contextPaths: readonly string[],
   preparedFiles: readonly PreparedPromptContextFile[],
+  preparedImages: readonly PreparedPromptImage[],
   allowEmbeddedContext: boolean,
 ): ContentBlock[] {
   const contextKeys = new Set(contextPaths.map(contextPathKey));
   const preparedByPath = new Map<string, PreparedPromptContextFile>();
+  const preparedImagesByPath = new Map<string, PreparedPromptImage>();
   for (const file of preparedFiles) {
     const key = contextPathKey(file.path);
     if (!contextKeys.has(key)) {
@@ -1885,10 +1899,27 @@ function createPromptContextBlocks(
     }
     preparedByPath.set(key, file);
   }
+  for (const image of preparedImages) {
+    const key = contextPathKey(image.path);
+    if (!contextKeys.has(key) || preparedByPath.has(key)) {
+      throw new TypeError("Prepared prompt images do not match the requested workspace files.");
+    }
+    preparedImagesByPath.set(key, image);
+  }
 
   return contextPaths.map((contextPath): ContentBlock => {
-    const prepared = preparedByPath.get(contextPathKey(contextPath));
+    const key = contextPathKey(contextPath);
+    const preparedImage = preparedImagesByPath.get(key);
     const uri = pathToFileURL(contextPath).href;
+    if (preparedImage) {
+      return {
+        type: "image",
+        data: preparedImage.data,
+        mimeType: preparedImage.mimeType,
+        uri,
+      };
+    }
+    const prepared = preparedByPath.get(key);
     if (allowEmbeddedContext && prepared?.text !== undefined) {
       return {
         type: "resource",

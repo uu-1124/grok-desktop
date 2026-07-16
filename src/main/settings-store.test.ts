@@ -56,6 +56,7 @@ describe("SettingsStore", () => {
     expect(snapshot.grokExecutablePath).toBe(executable);
     expect(snapshot.xaiApiBaseUrl).toBe("https://api.example.com/v1");
     expect(snapshot.permissionMode).toBe("default");
+    expect(snapshot.themePreference).toBe("system");
     expect(snapshot.recentWorkspaces).toEqual([
       expect.objectContaining({ path: workspace, label: "Current label" }),
     ]);
@@ -101,6 +102,20 @@ describe("SettingsStore", () => {
     expect(store.getSnapshot().permissionMode).toBe("default");
   });
 
+  it("persists the selected theme and rejects unknown preferences", async () => {
+    const { root, store } = await createStore();
+
+    await store.setThemePreference("dark");
+    const restored = new SettingsStore(root);
+    await restored.load();
+    expect(restored.getSnapshot().themePreference).toBe("dark");
+
+    await expect(restored.setThemePreference("contrast" as "dark")).rejects.toThrow(
+      "Invalid themePreference",
+    );
+    expect(restored.getSnapshot().themePreference).toBe("dark");
+  });
+
   it("preserves significant path whitespace instead of merging distinct workspaces", async () => {
     const { root, store } = await createStore();
     const plainWorkspace = path.join(root, "project");
@@ -139,6 +154,7 @@ describe("SettingsStore", () => {
       grokExecutablePath: null,
       xaiApiBaseUrl: null,
       permissionMode: "default",
+      themePreference: "system",
       lastWorkspacePath: null,
       recentWorkspaces: [],
       recentSessions: [],
@@ -231,6 +247,7 @@ describe("SettingsStore", () => {
 
     expect(restored.getSnapshot().xaiApiBaseUrl).toBeNull();
     expect(restored.getSnapshot().permissionMode).toBe("default");
+    expect(restored.getSnapshot().themePreference).toBe("system");
   });
 
   it("safely falls back to per-operation approval for an unknown stored permission mode", async () => {
@@ -254,6 +271,30 @@ describe("SettingsStore", () => {
     const restored = new SettingsStore(root);
     await restored.load();
     expect(restored.getSnapshot().permissionMode).toBe("default");
+  });
+
+  it("safely falls back to the system theme for an unknown stored preference", async () => {
+    const { root } = await createStore();
+    await writeFile(
+      path.join(root, "settings.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        settings: {
+          grokExecutablePath: null,
+          xaiApiBaseUrl: null,
+          permissionMode: "default",
+          themePreference: "forged-theme",
+          lastWorkspacePath: null,
+          recentWorkspaces: [],
+          recentSessions: [],
+        },
+      }),
+      "utf8",
+    );
+
+    const restored = new SettingsStore(root);
+    await restored.load();
+    expect(restored.getSnapshot().themePreference).toBe("system");
   });
 
   it("drops forged API keys and MCP configuration instead of persisting them", async () => {

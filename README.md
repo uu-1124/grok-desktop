@@ -4,7 +4,7 @@
 `grok.exe`，而是在运行时发现现有安装，并通过 Grok 官方 Agent Client Protocol
 （ACP）建立结构化连接。
 
-> 当前版本：`0.1.3` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
+> 当前版本：`0.1.4` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
 > 尚未进行 Windows 代码签名，公开分发时可能触发 SmartScreen 的未知发布者提示。
 
 源码与版本说明托管在 GitHub；Windows 安装包通过
@@ -18,10 +18,12 @@
   `default`、`auto` 与 `bypassPermissions + --always-approve`。默认仍为逐项授权；
   用户选择会保存到桌面设置，完全授权始终使用危险状态并要求显式确认。
 - 每次 ACP 连接使用独立的 Grok Agent，不复用共享 Leader，保证用户在桌面端选择的
-  API 地址、内存态 Key、模型和权限策略确实作用于当前连接。
+  API 地址、用户凭据、模型和权限策略确实作用于当前连接。
 - 结构化连接只接受用户明确提供的兼容 API Base URL 与 API Key，不使用默认端点、Grok
   登录或父进程凭据回退。远程地址必须使用 HTTPS，本机回环开发服务可使用 HTTP；Base URL
-  可以保存，API Key 只保留在当前桌面进程内，不写入配置。
+  可以保存；成功连接后的 API Key 使用 Electron `safeStorage` 加密，只保存到当前用户的
+  `userData`，且按 API Origin 绑定。Windows 使用 DPAPI；不安全的 Linux `basic_text` 后端
+  会被拒绝，不会降级为明文。
 - 设置页使用短生命周期 Grok ACP 连接检测地址并获取模型。检测只尝试同一 Origin 的候选路径：
   根地址优先尝试 `/v1`，非版本路径保留原路径并补充 `/v1` 候选，已带版本路径则保持原样。
   修改 URL 或 Key 会立即作废旧模型目录。
@@ -40,7 +42,7 @@
 - Composer 可引用当前工作区文件：路径会在主进程重新验证；Grok 广告 embedded context
   时，小型 UTF-8 文本仅随本次 prompt 内嵌，二进制或超大文件退回 ACP ResourceLink。
 - 渲染进程没有 Node.js 权限；进程、文件选择和持久化均由 Electron 主进程负责。
-- API Key、Token 和 Grok 会话正文不写入桌面端配置。
+- API Key 不写入普通配置、日志、快照或事件；Token 和 Grok 会话正文不进入桌面端存储。
 
 更详细的模块边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -119,7 +121,8 @@ npm run test:electron:package
 - 由桌面端打开过的会话 ID、标题与时间戳
 - 窗口和界面偏好
 
-API Key、模型目录、模型启用选择、MCP 服务器配置（含命令、参数与环境变量）及 Header
+API Key 不写入 `settings.json`；成功连接后只以 `safeStorage` 密文写入独立凭据文件，
+并可在设置页清除。模型目录、模型启用选择、MCP 服务器配置（含命令、参数与环境变量）及 Header
 不写入 `userData`。MCP 配置在当前桌面进程内按工作区隔离：切换项目不会携带其他项目的
 Header，切回原项目可继续使用，退出应用后全部清除。若界面进程单独重载，主进程只返回
 “当前连接存在 MCP 配置”的非敏感标记，不会把服务器 URL 或 Header 回传给新界面；设置页

@@ -72,17 +72,19 @@ const childEnvironment = { ...process.env };
 delete childEnvironment.XAI_API_KEY;
 delete childEnvironment.GROK_CODE_XAI_API_KEY;
 
-const appProcess = spawn(APP_PATH, [
-  "--remote-debugging-port=0",
-  `--user-data-dir=${userDataPath}`,
-  "--force-device-scale-factor=1.5",
-], {
-  cwd: WORKSPACE_ROOT,
-  env: childEnvironment,
-  shell: false,
-  stdio: "ignore",
-  windowsHide: true,
-});
+const launchAppProcess = () => spawn(APP_PATH, [
+    "--remote-debugging-port=0",
+    `--user-data-dir=${userDataPath}`,
+    "--force-device-scale-factor=1.5",
+  ], {
+    cwd: WORKSPACE_ROOT,
+    env: childEnvironment,
+    shell: false,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+
+let appProcess = launchAppProcess();
 
 let cdp = null;
 let passed = false;
@@ -183,12 +185,129 @@ try {
   assert.equal(connectionSetup.apiKeyVisible, false);
   assert.equal(mockApi.getAuthorizedModelRequestCount() >= 1, true);
   await cdp.captureScreenshot(CONNECTION_SCREENSHOT);
+
+  const encryptedCredential = await readFile(path.join(userDataPath, "xai-credential.bin"));
+  assert.equal(encryptedCredential.includes(Buffer.from(SMOKE_API_KEY, "utf8")), false);
+  const persistedSettings = await readFile(path.join(userDataPath, "settings.json"), "utf8");
+  assert.equal(persistedSettings.includes(SMOKE_API_KEY), false);
+  assert.equal(persistedSettings.includes("xaiApiKey"), false);
+
+  await cdp.evaluate("window.close()");
+  cdp.close();
+  cdp = null;
+  if (!await waitForProcessExit(appProcess, 5_000)) {
+    await terminateProcessTree(appProcess.pid);
+    await waitForProcessExit(appProcess, 5_000);
+  }
+  await rm(path.join(userDataPath, "DevToolsActivePort"), { force: true });
+
+  appProcess = launchAppProcess();
+  await waitForChildSpawn(appProcess);
+  const restartDebuggingPort = await waitForDevToolsPort(userDataPath, appProcess);
+  cdp = await CdpClient.connect(restartDebuggingPort, appProcess);
+  await cdp.send("Runtime.enable");
+  await cdp.send("Page.enable");
+
+  const credentialRestart = await cdp.evaluate(`(async () => {
+    const waitFor = async (predicate, timeout = 50000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) throw new Error("Timed out restoring the encrypted API key after restart");
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+    };
+    const setSelectValue = (element, value) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+      setter?.call(element, value);
+      element?.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    await waitFor(() => document.querySelector(".settings-modal"));
+    const apiKeyInput = document.querySelector("#xai-api-key");
+    const storedNotice = document.querySelector("#xai-api-key-stored-notice");
+    const discoveryButton = [...document.querySelectorAll(".model-discovery-actions button")].find(
+      (button) => button.textContent.includes("获取模型"),
+    );
+    await waitFor(() => discoveryButton && !discoveryButton.disabled);
+    discoveryButton.click();
+    await waitFor(() => document.querySelector(
+      ".model-discovery-status.is-ready, .model-discovery-status.is-error",
+    ));
+    const discoveryError = document.querySelector(".model-discovery-status.is-error")?.textContent?.trim();
+    if (discoveryError) throw new Error("Stored credential discovery failed: " + discoveryError);
+    const modelSelect = document.querySelector("#grok-model");
+    setSelectValue(modelSelect, "smoke-model-b");
+    await waitFor(() => modelSelect?.value === "smoke-model-b");
+    const applyButton = [...document.querySelectorAll(".settings-modal > footer button")].find(
+      (button) => button.textContent.includes("应用并重新连接"),
+    );
+    if (!applyButton || applyButton.disabled) throw new Error("Stored credential apply button remained disabled");
+    applyButton.click();
+    await waitFor(() => !document.querySelector(".settings-modal"));
+    await waitFor(() => document.querySelector(".app")?.dataset.phase === "ready");
+    await waitFor(() => document.querySelector('.composer-model-select select')?.value === "smoke-model-b");
+    document.querySelector('button[aria-label="打开设置"]')?.click();
+    await waitFor(() => document.querySelector(".settings-modal"));
+    return {
+      inputEmpty: apiKeyInput?.value === "",
+      storedNoticeVisible: Boolean(storedNotice),
+      placeholder: apiKeyInput?.getAttribute("placeholder") ?? "",
+      composerModel: document.querySelector('.composer-model-select select')?.value ?? "",
+      keyConfigured: document.querySelector(".composer-connection")?.dataset.keyConfigured ?? "",
+    };
+  })()`);
+
+  assert.equal(credentialRestart.inputEmpty, true);
+  assert.equal(credentialRestart.storedNoticeVisible, true);
+  assert.match(credentialRestart.placeholder, /本机安全保存/u);
+  assert.equal(credentialRestart.composerModel, "smoke-model-b");
+  assert.equal(credentialRestart.keyConfigured, "true");
+
   await cdp.evaluate(`(async () => {
     document.querySelector('.settings-modal button[aria-label="关闭设置"]')?.click();
     while (document.querySelector(".settings-modal")) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   })()`);
+
+  const slashCommands = await cdp.evaluate(`(async () => {
+    const waitFor = async (predicate, timeout = 30000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) throw new Error("Timed out waiting for Grok slash commands");
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+    };
+    const setTextareaValue = (element, value) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(element, value);
+      element?.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    await window.grokDesktop.createSession("Electron smoke slash commands");
+    await waitFor(() => document.querySelector(".conversation-header h1")?.textContent.includes("Electron smoke"));
+    const composer = document.querySelector('.composer textarea[aria-label="给 Grok 发送任务"]');
+    setTextareaValue(composer, "/");
+    await waitFor(() => document.querySelector(".composer-commands"));
+    const menu = document.querySelector(".composer-commands");
+    const commands = [...document.querySelectorAll(".composer-command strong")].map((item) => {
+      const label = item.textContent.trim();
+      return label.startsWith("/") ? label.slice(1) : label;
+    });
+    const result = {
+      count: commands.length,
+      commands,
+      heading: document.querySelector(".composer-commands__heading")?.textContent.trim() ?? "",
+      scrollable: (menu?.scrollHeight ?? 0) > (menu?.clientHeight ?? 0),
+    };
+    setTextareaValue(composer, "");
+    return result;
+  })()`);
+
+  assert.equal(slashCommands.count > 8, true);
+  for (const command of ["compact", "always-approve", "context", "session-info", "goal"]) {
+    assert.equal(slashCommands.commands.includes(command), true, `Missing Grok slash command: /${command}`);
+  }
+  assert.match(slashCommands.heading, new RegExp(`^命令${slashCommands.count} 个`, "u"));
+  assert.equal(slashCommands.scrollable, true);
 
   const historyRecovery = await cdp.evaluate(`(async () => {
     const waitFor = async (predicate, timeout = 35000) => {
@@ -335,6 +454,8 @@ try {
     await waitFor(() => document.querySelector(".app")?.dataset.phase === "ready" &&
       document.querySelector(".permission-mode-control")?.dataset.mode === "default");
     const modelAfterDefault = document.querySelector('.composer-model-select select')?.value ?? "";
+    await waitFor(() => !document.querySelector(".permission-mode-menu"));
+    await waitFor(() => !document.querySelector(".permission-mode-control__trigger")?.disabled);
     document.querySelector(".permission-mode-control__trigger")?.click();
     await waitFor(() => document.querySelector(".permission-mode-menu"));
     document.querySelector('[data-permission-option="auto"]')?.click();
@@ -357,6 +478,8 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     };
+    await waitFor(() => !document.querySelector(".permission-mode-menu"));
+    await waitFor(() => !document.querySelector(".permission-mode-control__trigger")?.disabled);
     document.querySelector(".permission-mode-control__trigger")?.click();
     await waitFor(() => document.querySelector(".permission-mode-menu"));
     document.querySelector('[data-permission-option="always_approve"]')?.click();
@@ -492,6 +615,8 @@ try {
     workspacePath: TEST_WORKSPACE,
     historyRecovery,
     connectionSetup,
+    credentialRestart,
+    slashCommands,
     permissionVisual,
     permissionNarrow,
     permissionControl,

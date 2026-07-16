@@ -15,7 +15,9 @@ import {
   getUsageLabel,
   deriveLocalSessionTitle,
   canRemoveStoredSession,
+  canUseStoredXaiCredential,
   filterStoredSessions,
+  filterAvailableCommands,
   groupStoredSessionsByRecency,
   hasUnrestoredMcpConfiguration,
   isTimelineNearBottom,
@@ -89,13 +91,25 @@ describe("xAI connection settings", () => {
 
   it("explains the credential source difference between default and custom endpoints", () => {
     expect(xaiApiKeyHelpText(" ")).toContain("URL 与 Key 必须同时提供");
-    expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("不会写入设置");
+    expect(xaiApiKeyHelpText("https://gateway.example.com/v1")).toContain("不写入普通设置");
   });
 
   it("requires an explicit URL and API key before discovery or connection", () => {
     expect(validateXaiConnectionPair("", "test-key")).toContain("Base URL 必填");
     expect(validateXaiConnectionPair("https://gateway.example.com/v1", "")).toContain("API Key 必填");
     expect(validateXaiConnectionPair("https://gateway.example.com/v1", "test-key")).toBeNull();
+    expect(validateXaiConnectionPair("https://gateway.example.com/v1", "", true)).toBeNull();
+  });
+
+  it("uses a stored credential only for its bound API origin", () => {
+    const credential = {
+      available: true,
+      scope: "https://gateway.example.com",
+      secureStorageAvailable: true,
+    };
+    expect(canUseStoredXaiCredential("https://gateway.example.com/v1", credential)).toBe(true);
+    expect(canUseStoredXaiCredential("https://gateway.example.com/v2", credential)).toBe(true);
+    expect(canUseStoredXaiCredential("https://other.example.com/v1", credential)).toBe(false);
   });
 
   it("advises remote root endpoints without rewriting valid custom URLs", () => {
@@ -189,6 +203,7 @@ describe("xAI connection settings", () => {
     };
     expect(requiresXaiApiKeyReentry(runtime, "https://gateway.example.com/v2", "")).toBe(true);
     expect(requiresXaiApiKeyReentry(runtime, "https://gateway.example.com/v2", "replacement-key")).toBe(false);
+    expect(requiresXaiApiKeyReentry(runtime, "https://gateway.example.com/v2", "", true)).toBe(false);
     expect(requiresXaiApiKeyReentry(runtime, "https://other.example.com/v1", "")).toBe(false);
     expect(requiresXaiApiKeyReentry({ ...runtime, xaiApiKeyConfigured: false }, "https://gateway.example.com/v1", "")).toBe(false);
     expect(requiresXaiApiKeyReentry({ ...runtime, xaiApiBaseUrl: null }, "", "")).toBe(true);
@@ -216,8 +231,8 @@ describe("xAI connection settings", () => {
       xaiApiBaseUrl: "https://gateway.example.com/v1",
       xaiApiKeyConfigured: true,
     })).toEqual({
-      label: "gateway.example.com · 内存 Key",
-      title: "当前 API：https://gateway.example.com/v1；API Key 仅保存在当前桌面进程。点击打开连接设置。",
+      label: "gateway.example.com · Key 已配置",
+      title: "当前 API：https://gateway.example.com/v1；API Key 已配置且不会进入普通设置或日志。点击打开连接设置。",
       keyConfigured: true,
     });
     expect(getXaiConnectionBadge({
@@ -380,6 +395,30 @@ describe("slash command selection", () => {
     expect(moveCommandSelection(2, 1, 3)).toBe(0);
     expect(moveCommandSelection(0, -1, 3)).toBe(2);
     expect(moveCommandSelection(0, 1, 0)).toBe(0);
+  });
+
+  it("keeps every ACP-advertised command instead of truncating the menu", () => {
+    const commands = Array.from({ length: 34 }, (_, index) => ({
+      name: `command-${index + 1}`,
+      description: `Command ${index + 1}`,
+      inputHint: null,
+    }));
+
+    expect(filterAvailableCommands(commands, "")).toEqual(commands);
+    expect(filterAvailableCommands(commands, "COMMAND-2").map((command) => command.name))
+      .toEqual([
+        "command-2",
+        "command-20",
+        "command-21",
+        "command-22",
+        "command-23",
+        "command-24",
+        "command-25",
+        "command-26",
+        "command-27",
+        "command-28",
+        "command-29",
+      ]);
   });
 });
 
@@ -848,12 +887,16 @@ describe("composer context files", () => {
       name: "main.ts",
       relativePath: "src\\main.ts",
       size: 100,
+      kind: "file" as const,
+      mimeType: null,
     };
     const second = {
       path: "D:\\project\\README.md",
       name: "README.md",
       relativePath: "README.md",
       size: 200,
+      kind: "file" as const,
+      mimeType: null,
     };
 
     expect(mergeContextFiles([first], [

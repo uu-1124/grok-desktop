@@ -72,8 +72,10 @@ Electron main process
   再验证工作区边界。Agent 广告 `embeddedContext` 时仅内嵌有界 UTF-8 文本，其他文件
   使用 ACP ResourceLink，不把正文返回 Renderer 或写入设置。
 - 每次结构化连接必须显式提供 API Base URL 与 API Key。远程地址只接受 HTTPS，HTTP 仅接受
-  回环主机；禁止 URL credentials、query 和 fragment。Base URL 是唯一持久化的连接字段，
-  API Key 通过子进程环境副本传给本次独立 Grok Agent，不进入快照、事件或设置。
+  回环主机；禁止 URL credentials、query 和 fragment。Base URL 写入普通设置；API Key 只在
+  成功连接后由 Main 使用 Electron `safeStorage` 加密，写入独立的 `xai-credential.bin`，不进入
+  快照、事件或 `settings.json`。Windows 密文由 DPAPI 绑定当前系统用户；Linux `basic_text`
+  后端被视为不安全并拒绝持久化。
 - 地址检测通过短生命周期 Grok ACP Runtime 完成，Renderer 和 Main 不直接请求第三方
   `/models`。候选始终保持协议、主机、端口和 Origin 不变：根路径依次尝试 `/v1` 与原地址，
   非版本路径依次尝试原地址与其 `/v1` 子路径，已以版本段结尾的路径只尝试原地址。只有成功
@@ -82,9 +84,9 @@ Electron main process
   别名、模型 Base URL 与模型列表覆盖，再通过参数和 `GROK_MODELS_BASE_URL` 把 Agent 与模型
   管理器绑定到同一个显式端点；用户 Key 只写入该子进程环境副本。
 - Runtime 快照只额外暴露规范化 Base URL 和“当前进程是否显式配置 API Key”的布尔值，
-  从不回传 Key 原文。Renderer 重载后若无法恢复内存 Key，会阻止同 Origin 的静默重连并
-  要求用户重新输入；切换到其他 Origin 时不会沿用旧凭据。
-- 对话 Composer 只从 Runtime 非敏感快照展示当前 API host 和“内存 Key”存在状态，点击可
+  从不回传 Key 原文。Bootstrap 仅返回本机安全凭据是否可用及其非敏感 Origin；Main 在连接
+  或模型发现时解密，同 Origin 才允许使用。切换到其他 Origin 时不会沿用旧凭据。
+- 对话 Composer 只从 Runtime 非敏感快照展示当前 API host 和“Key 已配置”状态，点击可
   返回连接设置；它不展示、复制或持久化 Key 原文。
 - 设置页的模型目录来自当前 URL + Key 成功连接后的 ACP 响应；编辑 URL 或 Key 会使旧目录
   立即失效。用户可以在进程内启用多个模型并选择初始模型；正式连接前由独立短生命周期
@@ -162,9 +164,11 @@ Electron main process
 
 ## 持久化边界
 
-桌面端设置与最近列表写入 Electron `userData`。以下数据不进入桌面端存储：
+桌面端设置与最近列表写入 Electron `userData`。API Key 是唯一的凭据存储例外：仅在成功
+连接后写入独立的 `safeStorage` 密文文件，绑定当前系统用户与 API Origin，可由用户主动清除。
+它不进入普通设置、Renderer、日志、快照或事件。以下数据不进入桌面端存储：
 
-- API Key、Token、认证码
+- Token、认证码及其他凭据
 - ACP 模型目录、模型启用选择与思考强度
 - MCP 服务器名称、URL、Header、stdio 命令、参数与环境变量
 - Grok 配置文件内容

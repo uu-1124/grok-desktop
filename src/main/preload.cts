@@ -1,13 +1,14 @@
-import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
+import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from "electron";
 
 import type {
-  ConnectRequest,
+  DesktopConnectRequest,
   DesktopApi,
   DesktopEventEnvelope,
-  DiscoverModelsRequest,
+  DesktopDiscoverModelsRequest,
   PermissionModePreference,
   PermissionResponsePayload,
   PromptRequest,
+  ThemePreference,
   TerminalResizeRequest,
   TerminalStartRequest,
 } from "../shared/contracts.js";
@@ -17,11 +18,14 @@ const CHANNELS = {
   syncRuntime: "grok-desktop:sync-runtime",
   chooseWorkspace: "grok-desktop:choose-workspace",
   chooseContextFiles: "grok-desktop:choose-context-files",
+  resolveDroppedFiles: "grok-desktop:resolve-dropped-files",
   chooseExecutable: "grok-desktop:choose-executable",
   chooseMcpExecutable: "grok-desktop:choose-mcp-executable",
   discoverModels: "grok-desktop:discover-models",
   setXaiApiBaseUrl: "grok-desktop:set-xai-api-base-url",
   setPermissionMode: "grok-desktop:set-permission-mode",
+  setThemePreference: "grok-desktop:set-theme-preference",
+  clearStoredXaiApiKey: "grok-desktop:clear-stored-xai-api-key",
   connect: "grok-desktop:connect",
   disconnect: "grok-desktop:disconnect",
   createSession: "grok-desktop:create-session",
@@ -47,15 +51,22 @@ const api: DesktopApi = Object.freeze({
   chooseWorkspace: () => ipcRenderer.invoke(CHANNELS.chooseWorkspace),
   chooseContextFiles: (workspacePath: string) =>
     ipcRenderer.invoke(CHANNELS.chooseContextFiles, workspacePath),
+  resolveDroppedFiles: (workspacePath: string, filePaths: string[]) =>
+    ipcRenderer.invoke(CHANNELS.resolveDroppedFiles, { workspacePath, filePaths }),
+  getPathForDroppedFile: (file: unknown) =>
+    webUtils.getPathForFile(file as Parameters<typeof webUtils.getPathForFile>[0]),
   chooseExecutable: () => ipcRenderer.invoke(CHANNELS.chooseExecutable),
   chooseMcpExecutable: () => ipcRenderer.invoke(CHANNELS.chooseMcpExecutable),
-  discoverModels: (request: DiscoverModelsRequest) =>
+  discoverModels: (request: DesktopDiscoverModelsRequest) =>
     ipcRenderer.invoke(CHANNELS.discoverModels, request),
   setXaiApiBaseUrl: (xaiApiBaseUrl: string | null) =>
     ipcRenderer.invoke(CHANNELS.setXaiApiBaseUrl, xaiApiBaseUrl),
   setPermissionMode: (permissionMode: PermissionModePreference) =>
     ipcRenderer.invoke(CHANNELS.setPermissionMode, permissionMode),
-  connect: (request: ConnectRequest) => ipcRenderer.invoke(CHANNELS.connect, request),
+  setThemePreference: (themePreference: ThemePreference) =>
+    ipcRenderer.invoke(CHANNELS.setThemePreference, themePreference),
+  clearStoredXaiApiKey: () => ipcRenderer.invoke(CHANNELS.clearStoredXaiApiKey),
+  connect: (request: DesktopConnectRequest) => ipcRenderer.invoke(CHANNELS.connect, request),
   disconnect: () => ipcRenderer.invoke(CHANNELS.disconnect),
   createSession: (title?: string) => ipcRenderer.invoke(CHANNELS.createSession, title),
   loadSession: (sessionId: string) => ipcRenderer.invoke(CHANNELS.loadSession, sessionId),

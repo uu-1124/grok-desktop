@@ -7,6 +7,7 @@ import type {
   PermissionModePreference,
   RecentWorkspace,
   StoredSession,
+  ThemePreference,
 } from "../shared/contracts.js";
 import { normalizeXaiApiBaseUrl } from "../shared/xai-connection.js";
 
@@ -24,6 +25,7 @@ const EMPTY_SETTINGS: DesktopSettingsSnapshot = {
   grokExecutablePath: null,
   xaiApiBaseUrl: null,
   permissionMode: "default",
+  themePreference: "system",
   lastWorkspacePath: null,
   recentWorkspaces: [],
   recentSessions: [],
@@ -79,6 +81,13 @@ export class SettingsStore {
     const value = requirePermissionMode(permissionMode);
     await this.#mutate((settings) => {
       settings.permissionMode = value;
+    });
+  }
+
+  async setThemePreference(themePreference: ThemePreference): Promise<void> {
+    const value = requireThemePreference(themePreference);
+    await this.#mutate((settings) => {
+      settings.themePreference = value;
     });
   }
 
@@ -196,6 +205,7 @@ function parseSettingsDocument(value: unknown): DesktopSettingsSnapshot {
     grokExecutablePath: nullablePath(settings.grokExecutablePath),
     xaiApiBaseUrl: normalizeStoredXaiApiBaseUrl(settings.xaiApiBaseUrl),
     permissionMode: parsePermissionMode(settings.permissionMode),
+    themePreference: parseThemePreference(settings.themePreference),
     lastWorkspacePath: nullablePath(settings.lastWorkspacePath),
     recentWorkspaces: Array.isArray(settings.recentWorkspaces)
       ? settings.recentWorkspaces
@@ -261,6 +271,17 @@ function requirePermissionMode(value: unknown): PermissionModePreference {
   return value;
 }
 
+function parseThemePreference(value: unknown): ThemePreference {
+  return value === "light" || value === "dark" ? value : "system";
+}
+
+function requireThemePreference(value: unknown): ThemePreference {
+  if (value !== "system" && value !== "light" && value !== "dark") {
+    throw new Error("Invalid themePreference.");
+  }
+  return value;
+}
+
 function optionalText(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -297,6 +318,7 @@ function cloneSnapshot(settings: DesktopSettingsSnapshot): DesktopSettingsSnapsh
     grokExecutablePath: settings.grokExecutablePath,
     xaiApiBaseUrl: settings.xaiApiBaseUrl,
     permissionMode: settings.permissionMode,
+    themePreference: settings.themePreference,
     lastWorkspacePath: settings.lastWorkspacePath,
     recentWorkspaces: settings.recentWorkspaces.map((entry) => ({ ...entry })),
     recentSessions: settings.recentSessions.map((entry) => ({ ...entry })),

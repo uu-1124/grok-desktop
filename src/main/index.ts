@@ -6,6 +6,7 @@ import {
   dialog,
   Menu,
   nativeTheme,
+  safeStorage,
   screen,
   session,
   type WebContents,
@@ -17,7 +18,8 @@ import { IPC_CHANNELS, registerIpcHandlers } from "./ipc.js";
 import { SettingsStore } from "./settings-store.js";
 import { TerminalManager } from "./terminal-manager.js";
 import { calculateInitialWindowSize } from "./window-bounds.js";
-import { windowChromeOptions } from "./window-chrome.js";
+import { windowChromeOptions, windowThemeColors } from "./window-chrome.js";
+import { XaiCredentialStore } from "./xai-credential-store.js";
 
 const WINDOW_TITLE = "Grok Desktop";
 const PRODUCTION_CSP = [
@@ -93,12 +95,17 @@ if (!ownsSingleInstanceLock) {
 
 async function initialize(): Promise<void> {
   app.setAppUserModelId("local.grok.desktop");
-  nativeTheme.themeSource = "light";
   Menu.setApplicationMenu(null);
   hardenRendererSessions();
 
   const settings = new SettingsStore(app.getPath("userData"));
   await settings.load();
+  const credentialStore = new XaiCredentialStore(
+    app.getPath("userData"),
+    safeStorage,
+    process.platform,
+  );
+  nativeTheme.themeSource = settings.getSnapshot().themePreference;
 
   const window = createMainWindow();
   mainWindow = window;
@@ -134,9 +141,24 @@ async function initialize(): Promise<void> {
   });
   runtime = grokRuntime;
   terminal = new TerminalManager((event) => eventBus.emit(event));
-  disposeIpc = registerIpcHandlers({ eventBus, window, runtime, settings, terminal });
+  disposeIpc = registerIpcHandlers({
+    eventBus,
+    window,
+    runtime,
+    settings,
+    terminal,
+    credentialStore,
+    applyThemePreference: (themePreference) => {
+      nativeTheme.themeSource = themePreference;
+      applyWindowTheme(window);
+    },
+  });
+
+  const handleNativeThemeUpdated = (): void => applyWindowTheme(window);
+  nativeTheme.on("updated", handleNativeThemeUpdated);
 
   window.once("closed", () => {
+    nativeTheme.off("updated", handleNativeThemeUpdated);
     mainWindow = null;
   });
 
@@ -149,13 +171,14 @@ function createMainWindow(): BrowserWindow {
   const windowSize = calculateInitialWindowSize(
     screen.getPrimaryDisplay().workAreaSize,
   );
+  const themeColors = windowThemeColors(nativeTheme.shouldUseDarkColors);
   const window = new BrowserWindow({
     title: WINDOW_TITLE,
     ...windowSize,
     show: false,
-    backgroundColor: "#f7f7f5",
+    backgroundColor: themeColors.backgroundColor,
     autoHideMenuBar: true,
-    ...windowChromeOptions(process.platform),
+    ...windowChromeOptions(process.platform, nativeTheme.shouldUseDarkColors),
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
@@ -177,6 +200,15 @@ function createMainWindow(): BrowserWindow {
   });
   window.center();
   return window;
+}
+
+function applyWindowTheme(window: BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  const colors = windowThemeColors(nativeTheme.shouldUseDarkColors);
+  window.setBackgroundColor(colors.backgroundColor);
+  if (process.platform === "win32") {
+    window.setTitleBarOverlay(colors.titleBarOverlay);
+  }
 }
 
 function hardenRendererSessions(): void {

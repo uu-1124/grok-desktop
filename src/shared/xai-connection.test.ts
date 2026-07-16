@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  getXaiApiCredentialScope,
   normalizeRequiredXaiConnection,
   xaiApiBaseUrlCandidates,
 } from "./xai-connection";
@@ -23,6 +24,17 @@ describe("explicit xAI connection pair", () => {
     ["https://gateway.example.com/v1", "", /API key/u],
   ])("rejects an incomplete connection pair %#", (baseUrl, apiKey, expected) => {
     expect(() => normalizeRequiredXaiConnection(baseUrl, apiKey)).toThrow(expected);
+  });
+});
+
+describe("xAI API credential scope", () => {
+  it("binds credentials to the normalized origin instead of an API path", () => {
+    expect(getXaiApiCredentialScope("https://API.EXAMPLE.COM:443/v1")).toBe(
+      "https://api.example.com",
+    );
+    expect(getXaiApiCredentialScope("http://localhost:8080/v1")).toBe(
+      "http://localhost:8080",
+    );
   });
 });
 

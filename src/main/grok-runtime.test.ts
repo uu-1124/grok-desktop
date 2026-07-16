@@ -682,6 +682,7 @@ describe("Grok prompt usage", () => {
       name: "package.json",
       relativePath: "package.json",
       size: 23,
+      kind: "file",
       text: '{"name":"grok-desktop"}',
       mimeType: "application/json",
     }]);
@@ -697,6 +698,50 @@ describe("Grok prompt usage", () => {
             text: '{"name":"grok-desktop"}',
             mimeType: "application/json",
           },
+        },
+      ],
+    });
+  });
+
+  it("sends prepared images as ACP image blocks", async () => {
+    let promptParams: Record<string, unknown> | undefined;
+    const runtime = new GrokRuntime(() => undefined, {
+      createId: () => "turn-image",
+    });
+    attachFakeAgent(runtime, async (method, params) => {
+      if (method === "session/new") return { sessionId: "session-image" };
+      if (method === "session/prompt") {
+        promptParams = params as Record<string, unknown>;
+        return { stopReason: "end_turn" };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await runtime.createSession("Image test");
+    const imagePath = path.join("D:\\project", "diagram.png");
+    await runtime.prompt({
+      sessionId: "session-image",
+      text: "Review this image",
+      contextPaths: [imagePath],
+    }, [], [{
+      path: imagePath,
+      name: "diagram.png",
+      relativePath: "diagram.png",
+      size: 8,
+      kind: "image",
+      mimeType: "image/png",
+      data: "iVBORw0KGgo=",
+    }]);
+
+    expect(promptParams).toEqual({
+      sessionId: "session-image",
+      prompt: [
+        { type: "text", text: "Review this image" },
+        {
+          type: "image",
+          data: "iVBORw0KGgo=",
+          mimeType: "image/png",
+          uri: pathToFileURL(imagePath).href,
         },
       ],
     });
@@ -738,6 +783,40 @@ describe("Grok prompt usage", () => {
       },
     });
     expect(JSON.stringify(update)).not.toContain("do-not-cross-the-preload-boundary");
+  });
+
+  it("removes base64 image data before prompt echoes cross into the renderer", async () => {
+    const events: DesktopEvent[] = [];
+    const runtime = new GrokRuntime((event) => events.push(event));
+    attachFakeAgent(runtime, async (method) => {
+      if (method === "session/new") return { sessionId: "session-image" };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    await runtime.createSession("Sanitized image echo");
+    events.length = 0;
+
+    emitFakeUpdate(runtime, "session-image", {
+      sessionUpdate: "user_message_chunk",
+      content: {
+        type: "image",
+        data: "base64-data-must-not-cross",
+        mimeType: "image/png",
+        uri: "file:///D:/project/diagram.png",
+      },
+    });
+
+    const update = events.find((event) => event.type === "session-update");
+    expect(update).toMatchObject({
+      type: "session-update",
+      update: {
+        content: {
+          type: "image",
+          mimeType: "image/png",
+          uri: "file:///D:/project/diagram.png",
+        },
+      },
+    });
+    expect(JSON.stringify(update)).not.toContain("base64-data-must-not-cross");
   });
 
   it("rejects forged prompt resource paths outside the connected workspace", async () => {

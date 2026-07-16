@@ -81,6 +81,10 @@ export function FileIcon(props: IconProps) {
   return <IconBase {...props}><path d="M6 3.5h7l5 5v12H6v-17Z" stroke="currentColor" strokeLinejoin="round"/><path d="M13 3.5v5h5" stroke="currentColor" strokeLinejoin="round"/></IconBase>;
 }
 
+export function ImageIcon(props: IconProps) {
+  return <IconBase {...props}><rect x="3.5" y="4" width="17" height="16" rx="2" stroke="currentColor"/><circle cx="9" cy="9.5" r="1.5" stroke="currentColor"/><path d="m5.5 17 4-4 3 3 2-2 4 4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"/></IconBase>;
+}
+
 export function CheckIcon(props: IconProps) {
   return <IconBase {...props}><path d="m5 12.5 4.25 4.25L19 7" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"/></IconBase>;
 }

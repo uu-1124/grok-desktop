@@ -9,10 +9,25 @@ import {
 const MAX_PATH_LENGTH = 32_767;
 const MAX_EMBEDDED_CONTEXT_FILE_BYTES = 256 * 1_024;
 const MAX_EMBEDDED_CONTEXT_TOTAL_BYTES = 512 * 1_024;
+export const MAX_PROMPT_IMAGE_FILE_BYTES = 10 * 1_024 * 1_024;
+export const MAX_PROMPT_IMAGE_TOTAL_BYTES = 20 * 1_024 * 1_024;
+
+const IMAGE_MIME_TYPES = new Map([
+  [".gif", "image/gif"],
+  [".jpeg", "image/jpeg"],
+  [".jpg", "image/jpeg"],
+  [".png", "image/png"],
+  [".webp", "image/webp"],
+]);
 
 export interface PreparedPromptContextFile extends ContextFileReference {
   text?: string;
-  mimeType?: string;
+}
+
+export interface PreparedPromptImage extends ContextFileReference {
+  kind: "image";
+  mimeType: string;
+  data: string;
 }
 
 export function isPathWithinWorkspace(
@@ -64,11 +79,19 @@ export async function resolveWorkspaceContextFiles(
         continue;
       }
       seen.add(key);
+      const imageMimeType = imageMimeTypeForPath(canonicalPath);
+      if (imageMimeType && entry.size > MAX_PROMPT_IMAGE_FILE_BYTES) {
+        throw new Error(
+          `图片不能超过 ${MAX_PROMPT_IMAGE_FILE_BYTES / 1_024 / 1_024} MiB。`,
+        );
+      }
       references.push({
         path: canonicalPath,
         name: path.basename(canonicalPath),
         relativePath: path.relative(canonicalWorkspace, canonicalPath),
         size: Math.min(entry.size, Number.MAX_SAFE_INTEGER),
+        kind: imageMimeType ? "image" : "file",
+        mimeType: imageMimeType,
       });
     } catch (error: unknown) {
       if (
@@ -76,6 +99,7 @@ export async function resolveWorkspaceContextFiles(
         [
           "只能引用普通文件。",
           "只能引用当前工作区内的文件。",
+          `图片不能超过 ${MAX_PROMPT_IMAGE_FILE_BYTES / 1_024 / 1_024} MiB。`,
         ].includes(error.message)
       ) {
         throw error;
@@ -124,12 +148,63 @@ export async function preparePromptContextFiles(
       prepared.push({
         ...reference,
         text,
-        mimeType: mimeTypeForPath(reference.path),
+        mimeType: textMimeTypeForPath(reference.path),
       });
       remainingBytes -= content.byteLength;
     } catch {
       prepared.push({ ...reference });
     }
+  }
+  return prepared;
+}
+
+export async function preparePromptImages(
+  references: readonly ContextFileReference[],
+): Promise<PreparedPromptImage[]> {
+  let remainingBytes = MAX_PROMPT_IMAGE_TOTAL_BYTES;
+  const prepared: PreparedPromptImage[] = [];
+  for (const reference of references) {
+    const expectedMimeType = imageMimeTypeForPath(reference.path);
+    if (
+      reference.kind !== "image" ||
+      !expectedMimeType ||
+      reference.mimeType !== expectedMimeType
+    ) {
+      throw new Error(`不支持的图片格式：${reference.relativePath}`);
+    }
+    if (reference.size > MAX_PROMPT_IMAGE_FILE_BYTES || reference.size > remainingBytes) {
+      throw new Error(
+        `图片附件总大小不能超过 ${MAX_PROMPT_IMAGE_TOTAL_BYTES / 1_024 / 1_024} MiB。`,
+      );
+    }
+
+    let content: Uint8Array;
+    try {
+      content = await readFileBounded(reference.path, MAX_PROMPT_IMAGE_FILE_BYTES);
+    } catch {
+      throw new Error(`图片在发送前无法读取：${reference.relativePath}`);
+    }
+    if (content.byteLength > MAX_PROMPT_IMAGE_FILE_BYTES) {
+      throw new Error(
+        `图片不能超过 ${MAX_PROMPT_IMAGE_FILE_BYTES / 1_024 / 1_024} MiB：${reference.relativePath}`,
+      );
+    }
+    if (content.byteLength > remainingBytes) {
+      throw new Error(
+        `图片附件总大小不能超过 ${MAX_PROMPT_IMAGE_TOTAL_BYTES / 1_024 / 1_024} MiB。`,
+      );
+    }
+    if (detectImageMimeType(content) !== expectedMimeType) {
+      throw new Error(`图片内容与文件格式不匹配：${reference.relativePath}`);
+    }
+
+    prepared.push({
+      ...reference,
+      kind: "image",
+      mimeType: expectedMimeType,
+      data: Buffer.from(content).toString("base64"),
+    });
+    remainingBytes -= content.byteLength;
   }
   return prepared;
 }
@@ -161,7 +236,36 @@ function isLikelyBinary(value: Uint8Array): boolean {
   return value.byteLength > MAX_EMBEDDED_CONTEXT_FILE_BYTES || value.includes(0);
 }
 
-function mimeTypeForPath(filePath: string): string {
+function imageMimeTypeForPath(filePath: string): string | null {
+  return IMAGE_MIME_TYPES.get(path.extname(filePath).toLocaleLowerCase("en-US")) ?? null;
+}
+
+function detectImageMimeType(value: Uint8Array): string | null {
+  if (
+    value.length >= 8 &&
+    value[0] === 0x89 && value[1] === 0x50 && value[2] === 0x4e && value[3] === 0x47 &&
+    value[4] === 0x0d && value[5] === 0x0a && value[6] === 0x1a && value[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (value.length >= 3 && value[0] === 0xff && value[1] === 0xd8 && value[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (value.length >= 6) {
+    const signature = Buffer.from(value.subarray(0, 6)).toString("ascii");
+    if (signature === "GIF87a" || signature === "GIF89a") return "image/gif";
+  }
+  if (
+    value.length >= 12 &&
+    Buffer.from(value.subarray(0, 4)).toString("ascii") === "RIFF" &&
+    Buffer.from(value.subarray(8, 12)).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function textMimeTypeForPath(filePath: string): string {
   switch (path.extname(filePath).toLocaleLowerCase("en-US")) {
     case ".json": return "application/json";
     case ".md":

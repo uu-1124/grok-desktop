@@ -50,6 +50,8 @@ export interface ContextFileReference {
   name: string;
   relativePath: string;
   size: number;
+  kind: "file" | "image";
+  mimeType: string | null;
 }
 
 export interface StoredSession {
@@ -61,12 +63,14 @@ export interface StoredSession {
 }
 
 export type PermissionModePreference = "default" | "auto" | "always_approve";
+export type ThemePreference = "system" | "light" | "dark";
 
 export interface DesktopSettingsSnapshot {
   grokExecutablePath: string | null;
   /** Non-sensitive normalized endpoint; credentials must never be embedded in this URL. */
   xaiApiBaseUrl: string | null;
   permissionMode: PermissionModePreference;
+  themePreference: ThemePreference;
   lastWorkspacePath: string | null;
   recentWorkspaces: RecentWorkspace[];
   recentSessions: StoredSession[];
@@ -75,8 +79,15 @@ export interface DesktopSettingsSnapshot {
 export interface BootstrapPayload {
   installation: GrokInstallation;
   settings: DesktopSettingsSnapshot;
+  xaiCredential: XaiCredentialStatus;
   platform: string;
   appVersion: string;
+}
+
+export interface XaiCredentialStatus {
+  available: boolean;
+  scope: string | null;
+  secureStorageAvailable: boolean;
 }
 
 export type McpHttpTransport = "http" | "sse";
@@ -133,6 +144,13 @@ export interface ConnectRequest {
   allowStdioMcpExecution?: true;
 }
 
+export type XaiApiCredentialRequest =
+  | { xaiApiKey: string; useStoredXaiApiKey?: never }
+  | { xaiApiKey?: never; useStoredXaiApiKey: true };
+
+export type DesktopConnectRequest = Omit<ConnectRequest, "xaiApiKey"> &
+  XaiApiCredentialRequest;
+
 export interface AuthMethodInfo {
   id: string;
   name: string;
@@ -154,6 +172,9 @@ export interface DiscoverModelsRequest {
   /** Per-process secret used only by the short-lived ACP discovery runtime. */
   xaiApiKey: string;
 }
+
+export type DesktopDiscoverModelsRequest = Omit<DiscoverModelsRequest, "xaiApiKey"> &
+  XaiApiCredentialRequest;
 
 export interface DiscoverModelsResult {
   resolvedBaseUrl: string;
@@ -218,7 +239,7 @@ export interface RuntimeSnapshot {
   permissionMode: PermissionModePreference | null;
   /** Normalized non-secret endpoint used by the current or latest connection attempt. */
   xaiApiBaseUrl: string | null;
-  /** True only while the active Grok process received an explicit in-memory API key. */
+  /** True only while the active Grok process received an explicit API key. */
   xaiApiKeyConfigured: boolean;
   mcpConfigured: boolean;
   /** Count reported by Grok without exposing any native MCP configuration. */
@@ -280,7 +301,7 @@ export interface SessionReadyPayload {
 export interface PromptRequest {
   sessionId: string;
   text: string;
-  /** Canonical workspace-local files sent to Grok as ACP resource links. */
+  /** Canonical workspace-local attachments sent through ACP file or image blocks. */
   contextPaths?: string[];
 }
 
@@ -394,6 +415,8 @@ export interface RuntimeSyncPayload {
 export interface ConnectResult {
   snapshot: RuntimeSnapshot;
   xaiApiBaseUrlPersisted: boolean;
+  xaiApiKeyPersisted: boolean;
+  xaiCredential: XaiCredentialStatus;
   permissionModePersisted: boolean;
 }
 
@@ -402,12 +425,19 @@ export interface DesktopApi {
   syncRuntime(afterSequence?: number): Promise<RuntimeSyncPayload>;
   chooseWorkspace(): Promise<string | null>;
   chooseContextFiles(workspacePath: string): Promise<ContextFileReference[]>;
+  resolveDroppedFiles(
+    workspacePath: string,
+    filePaths: string[],
+  ): Promise<ContextFileReference[]>;
+  getPathForDroppedFile(file: unknown): string;
   chooseExecutable(): Promise<GrokInstallation | null>;
   chooseMcpExecutable(): Promise<string | null>;
-  discoverModels(request: DiscoverModelsRequest): Promise<DiscoverModelsResult>;
+  discoverModels(request: DesktopDiscoverModelsRequest): Promise<DiscoverModelsResult>;
   setXaiApiBaseUrl(xaiApiBaseUrl: string | null): Promise<string | null>;
   setPermissionMode(mode: PermissionModePreference): Promise<PermissionModePreference>;
-  connect(request: ConnectRequest): Promise<ConnectResult>;
+  setThemePreference(theme: ThemePreference): Promise<ThemePreference>;
+  clearStoredXaiApiKey(): Promise<XaiCredentialStatus>;
+  connect(request: DesktopConnectRequest): Promise<ConnectResult>;
   disconnect(): Promise<void>;
   createSession(title?: string): Promise<SessionReadyPayload>;
   loadSession(sessionId: string): Promise<SessionReadyPayload>;

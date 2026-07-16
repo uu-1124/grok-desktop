@@ -1,6 +1,6 @@
 {
   "name": "grok-desktop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "A local Windows desktop client for the installed Grok coding agent.",
   "author": "uu-1124",
