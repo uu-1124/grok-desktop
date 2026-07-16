@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -87,11 +87,12 @@ describe("workspace context files", () => {
     await mkdir(workspace, { recursive: true });
     await writeFile(imagePath, new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     await writeFile(textPath, "outside", "utf8");
+    const canonicalImagePath = await realpath(imagePath);
 
     await expect(resolveWorkspaceContextFiles(workspace, [imagePath], {
       allowExternalImages: true,
     })).resolves.toEqual([expect.objectContaining({
-      path: imagePath,
+      path: canonicalImagePath,
       kind: "image",
       mimeType: "image/png",
     })]);
