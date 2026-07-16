@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  constrainSessionCapabilitiesToModels,
   parseAgentCapabilities,
   parseAvailableCommands,
   parseReportedMcpServerCount,
@@ -164,37 +165,38 @@ describe("ACP capability normalization", () => {
     expect(JSON.stringify(result)).not.toContain("must not cross");
   });
 
-  it("maps Grok session metadata options into a model selector", () => {
+  it("does not promote private Grok model aliases into the advertised catalog", () => {
     const result = parseSessionCapabilities({
       models: {
-        currentModelId: "grok-build",
-        availableModels: [{ modelId: "grok-build", name: "Grok Build" }],
+        currentModelId: "grok-4.5",
+        availableModels: [
+          { modelId: "grok-4.5", name: "grok-4.5" },
+          { modelId: "grok-4.5-latest", name: "grok-4.5-latest" },
+        ],
       },
       _meta: {
         "x.ai/sessionConfig": {
           options: [
-            { id: "jbbtoken-grok-45", category: "model", label: "JBBToken Grok 4.5", selected: false },
-            { id: "grok-build", category: "model", label: "Grok Build", selected: true },
+            { id: "jbbtoken-grok-45", category: "model", label: "JBBToken Grok 4.5", selected: true },
+            { id: "grok-build", category: "model", label: "grok-4.5", selected: false },
           ],
         },
       },
     });
 
-    expect(result.currentModelId).toBe("grok-build");
+    expect(result.currentModelId).toBe("grok-4.5");
     expect(result.availableModels).toEqual([
-      { id: "grok-build", name: "Grok Build" },
-      { id: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+      { id: "grok-4.5", name: "grok-4.5" },
+      { id: "grok-4.5-latest", name: "grok-4.5-latest" },
     ]);
     expect(result.configOptions).toEqual([expect.objectContaining({
-      id: "model",
-      type: "select",
       category: "model",
-      currentValue: "grok-build",
+      currentValue: "jbbtoken-grok-45",
       readOnly: true,
     })]);
   });
 
-  it("ignores non-model Grok session metadata options and their selected state", () => {
+  it("keeps legacy Grok aliases session-only when no advertised catalog exists", () => {
     const result = parseSessionCapabilities({
       _meta: {
         "x.ai/sessionConfig": {
@@ -206,23 +208,164 @@ describe("ACP capability normalization", () => {
               selected: true,
             },
             {
-              id: "grok-build",
+              id: "jbbtoken-grok-45",
               category: "model",
-              label: "Grok Build",
-              selected: false,
+              label: "JBBToken Grok 4.5",
+              selected: true,
             },
           ],
         },
       },
     });
 
-    expect(result.availableModels).toEqual([{ id: "grok-build", name: "Grok Build" }]);
-    expect(result.currentModelId).toBe("grok-build");
+    expect(result.availableModels).toEqual([]);
+    expect(result.currentModelId).toBeNull();
     expect(result.configOptions).toEqual([expect.objectContaining({
       category: "model",
-      currentValue: "grok-build",
-      options: [{ value: "grok-build", name: "Grok Build" }],
+      currentValue: "jbbtoken-grok-45",
+      readOnly: true,
     })]);
+  });
+
+  it("uses standard model config options as an authoritative catalog", () => {
+    const result = parseSessionCapabilities({
+      configOptions: [{
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "grok-build",
+        category: "model",
+        options: [
+          { value: "grok-build", name: "Grok Build" },
+          { value: "grok-latest", name: "Grok Latest" },
+        ],
+      }],
+      _meta: {
+        "x.ai/sessionConfig": {
+          options: [{
+            id: "jbbtoken-grok-45",
+            category: "model",
+            label: "JBBToken Grok 4.5",
+            selected: true,
+          }],
+        },
+      },
+    });
+
+    expect(result.availableModels).toEqual([
+      { id: "grok-build", name: "Grok Build" },
+      { id: "grok-latest", name: "Grok Latest" },
+    ]);
+    expect(result.currentModelId).toBe("grok-build");
+    expect(result.configOptions).toEqual([expect.objectContaining({
+      id: "model",
+      category: "model",
+      currentValue: "grok-build",
+    })]);
+    expect(JSON.stringify(result)).not.toContain("jbbtoken-grok-45");
+  });
+
+  it("removes session model aliases outside an isolated discovery catalog", () => {
+    const constrained = constrainSessionCapabilitiesToModels(
+      parseSessionCapabilities({
+        _meta: {
+          modelState: {
+            currentModelId: "jbbtoken-grok-45",
+            availableModels: [
+              { modelId: "grok-4.5", name: "grok-4.5" },
+              { modelId: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+            ],
+          },
+          "x.ai/sessionConfig": {
+            options: [{
+              id: "jbbtoken-grok-45",
+              category: "model",
+              label: "JBBToken Grok 4.5",
+              selected: true,
+            }],
+          },
+        },
+      }),
+      [{ id: "grok-4.5", name: "grok-4.5" }],
+    );
+
+    expect(constrained).toEqual({
+      configOptions: [],
+      availableModels: [{ id: "grok-4.5", name: "grok-4.5" }],
+      currentModelId: null,
+    });
+  });
+
+  it("uses isolated discovery metadata for matching session model ids", () => {
+    const constrained = constrainSessionCapabilitiesToModels({
+      configOptions: [{
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "grok-4.5",
+        readOnly: false,
+        category: "model",
+        options: [
+          { value: "grok-4.5", name: "JBBToken Same-ID Override" },
+          { value: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+        ],
+      }],
+      availableModels: [
+        { id: "grok-4.5", name: "JBBToken Same-ID Override" },
+        { id: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+      ],
+      currentModelId: "grok-4.5",
+    }, [{
+      id: "grok-4.5",
+      name: "grok-4.5",
+      description: "Isolated API model",
+    }]);
+
+    expect(constrained).toEqual({
+      configOptions: [expect.objectContaining({
+        currentValue: "grok-4.5",
+        options: [{
+          value: "grok-4.5",
+          name: "grok-4.5",
+          description: "Isolated API model",
+        }],
+      })],
+      availableModels: [{
+        id: "grok-4.5",
+        name: "grok-4.5",
+        description: "Isolated API model",
+      }],
+      currentModelId: "grok-4.5",
+    });
+  });
+
+  it("does not duplicate a standard model config id with a legacy selector", () => {
+    const result = parseSessionCapabilities({
+      configOptions: [{
+        id: "model",
+        name: "Model-like setting",
+        type: "select",
+        currentValue: "standard-value",
+        options: [{ value: "standard-value", name: "Standard value" }],
+      }],
+      _meta: {
+        "x.ai/sessionConfig": {
+          options: [{
+            id: "jbbtoken-grok-45",
+            category: "model",
+            label: "JBBToken Grok 4.5",
+            selected: true,
+          }],
+        },
+      },
+    });
+
+    expect(result.configOptions).toHaveLength(1);
+    expect(result.configOptions[0]).toMatchObject({
+      id: "model",
+      currentValue: "standard-value",
+      readOnly: false,
+    });
   });
 
   it("does not synthesize model capabilities from non-model extension options", () => {

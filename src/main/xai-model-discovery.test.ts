@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { stat } from "node:fs/promises";
+import path from "node:path";
 
 import { createEmptyRuntimeCapabilities } from "../shared/contracts";
 import type { ConnectRequest, ModelInfo, RuntimeSnapshot } from "../shared/contracts";
@@ -47,6 +49,43 @@ function request(overrides: Partial<ConnectRequest> = {}): ConnectRequest {
 }
 
 describe("xAI ACP endpoint and model discovery", () => {
+  it("uses and removes an isolated Grok home for discovery", async () => {
+    let discoveryHome = "";
+    const connect = vi.fn(async (attempt: ConnectRequest) => {
+      await expect(stat(discoveryHome)).resolves.toBeDefined();
+      return snapshot(attempt.xaiApiBaseUrl);
+    });
+
+    await discoverXaiModels(
+      (grokHome) => {
+        discoveryHome = grokHome;
+        return { connect, disconnect: vi.fn(async () => undefined) };
+      },
+      request(),
+    );
+
+    expect(path.isAbsolute(discoveryHome)).toBe(true);
+    expect(path.basename(discoveryHome)).toMatch(/^grok-desktop-model-discovery-/u);
+    await expect(stat(discoveryHome)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("removes every isolated Grok home when runtime construction fails", async () => {
+    const discoveryHomes: string[] = [];
+
+    await expect(discoverXaiModels(
+      (grokHome) => {
+        discoveryHomes.push(grokHome);
+        throw new Error("simulated runtime construction failure");
+      },
+      request(),
+    )).rejects.toThrow(/Unable to resolve/u);
+
+    expect(discoveryHomes).toHaveLength(2);
+    await Promise.all(discoveryHomes.map(async (grokHome) => {
+      await expect(stat(grokHome)).rejects.toMatchObject({ code: "ENOENT" });
+    }));
+  });
+
   it("prefers /v1 for an arbitrary root URL and returns ACP-advertised models", async () => {
     const connect = vi.fn(async (attempt: ConnectRequest) =>
       snapshot(attempt.xaiApiBaseUrl));
@@ -126,6 +165,22 @@ describe("xAI ACP endpoint and model discovery", () => {
       { id: "model-b", name: "Model B" },
     ]);
     expect(result.currentModelId).toBe("model-b");
+  });
+
+  it("binds the isolated discovery default when no model was explicitly requested", async () => {
+    const targetConnect = vi.fn(async (attempt: ConnectRequest) =>
+      snapshot(attempt.xaiApiBaseUrl, attempt.modelId ?? null));
+
+    await connectWithXaiApiDiscovery(
+      () => ({
+        connect: vi.fn(async (attempt) => snapshot(attempt.xaiApiBaseUrl, "model-b")),
+        disconnect: vi.fn(async () => undefined),
+      }),
+      { connectWithAdvertisedModels: targetConnect },
+      request(),
+    );
+
+    expect(targetConnect.mock.calls[0]?.[0]).toMatchObject({ modelId: "model-b" });
   });
 
   it("rejects a disappeared model without disturbing the target runtime", async () => {

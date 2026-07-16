@@ -71,15 +71,18 @@ Electron main process
 - Prompt 文件上下文只接受用户从当前工作区选择的普通文件；主进程使用 canonical path
   再验证工作区边界。Agent 广告 `embeddedContext` 时仅内嵌有界 UTF-8 文本，其他文件
   使用 ACP ResourceLink，不把正文返回 Renderer 或写入设置。
+- Windows 文件拖拽通过 Electron `webUtils.getPathForFile` 取得本地路径，再由 Main 做 canonical path、大小和类型校验。工作区外仅允许受支持且文件签名匹配的图片；Agent 广告 `promptCapabilities.image` 时发送 ACP Image block，否则发送不含 Base64 的 ResourceLink。普通文件始终保持工作区边界。
 - 每次结构化连接必须显式提供 API Base URL 与 API Key。远程地址只接受 HTTPS，HTTP 仅接受
   回环主机；禁止 URL credentials、query 和 fragment。Base URL 写入普通设置；API Key 只在
   成功连接后由 Main 使用 Electron `safeStorage` 加密，写入独立的 `xai-credential.bin`，不进入
   快照、事件或 `settings.json`。Windows 密文由 DPAPI 绑定当前系统用户；Linux `basic_text`
   后端被视为不安全并拒绝持久化。
 - 地址检测通过短生命周期 Grok ACP Runtime 完成，Renderer 和 Main 不直接请求第三方
-  `/models`。候选始终保持协议、主机、端口和 Origin 不变：根路径依次尝试 `/v1` 与原地址，
-  非版本路径依次尝试原地址与其 `/v1` 子路径，已以版本段结尾的路径只尝试原地址。只有成功
-  完成 ACP 初始化的候选才能返回解析后的 Base URL 和该连接广告的模型。
+  `/models`。每个同源候选使用独立临时 `GROK_HOME`，避免用户 `config.toml` 中的自定义模型
+  别名扩张远端目录；Runtime 断开并确认子进程退出后删除该目录。候选始终保持协议、主机、
+  端口和 Origin 不变：根路径依次尝试 `/v1` 与原地址，非版本路径依次尝试原地址与其 `/v1`
+  子路径，已以版本段结尾的路径只尝试原地址。只有成功完成 ACP 初始化的候选才能返回解析后
+  的 Base URL 和该连接广告的模型。
 - 创建 Grok 子进程时按 Windows 不区分大小写的环境变量语义清除继承的 API Key、旧 Key
   别名、模型 Base URL 与模型列表覆盖，再通过参数和 `GROK_MODELS_BASE_URL` 把 Agent 与模型
   管理器绑定到同一个显式端点；用户 Key 只写入该子进程环境副本。
@@ -90,10 +93,16 @@ Electron main process
   返回连接设置；它不展示、复制或持久化 Key 原文。
 - 设置页的模型目录来自当前 URL + Key 成功连接后的 ACP 响应；编辑 URL 或 Key 会使旧目录
   立即失效。用户可以在进程内启用多个模型并选择初始模型；正式连接前由独立短生命周期
-  Runtime 针对同一 URL + Key 重新验证选择，验证失败不会触碰当前长期 Runtime。Composer
-  切换模型时，若 Agent 提供可写会话模型配置则调用 `session/set_config_option`；只读或进程级
-  模型通过带 `--model=<id>` 的独立 Agent 重连生效。权限切换、终端返回与普通重连会继续携带
-  当前仍启用的模型及其匹配思考强度。
+  Runtime 针对同一 URL + Key 重新验证选择，验证失败不会触碰当前长期 Runtime。该目录同时
+  成为正式 Runtime 整个连接生命周期的 allow-list；`initialize`、`session/new`、`session/load`
+  和配置更新只能收缩目录，不能由真实 Grok Home 中的本地别名扩张。Composer 切换模型时，
+  若 Agent 提供可写会话模型配置则调用 `session/set_config_option`；只读或进程级模型通过带
+  `--model=<id>` 的独立 Agent 重连生效。权限切换、终端返回与普通重连会继续携带当前仍启用
+  的模型及其匹配思考强度。
+- Grok 0.2.101 的 ACP 模型状态不包含最终推理 endpoint。桌面端会拒绝同 ID 但名称、描述或
+  思考强度元数据不同的本地覆盖，并始终展示隔离发现得到的权威元数据；若用户本地模型使用
+  与远端完全相同的 ID 和广告元数据却指向其他 endpoint，ACP 无法区分，这仍属于外部 Grok
+  配置信任边界。桌面端不会读取或改写 `config.toml` 来猜测该状态。
 - ACP 广告的模型 ID、名称、描述与思考强度在进入 Runtime 快照或进程参数前检查凭据反射；
   任何包含本次 API Key 原文、JSON 转义或 URL 编码变体的控制值都会使连接安全失败。
 - `modelState.availableModels[*]._meta.reasoningEfforts` 仅在 Grok 明确广告时才被归一化为

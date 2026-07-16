@@ -66,6 +66,24 @@ await mkdir(ARTIFACTS_DIR, { recursive: true });
 const mockApi = await startMockApi();
 const userDataPath = await mkdtemp(path.join(os.tmpdir(), "grok-desktop-smoke-"));
 assertSafeTemporaryUserDataPath(userDataPath);
+const dropFixtureId = randomUUID();
+const droppedWorkspaceFilePath = path.join(
+  TEST_WORKSPACE,
+  `.grok-desktop-smoke-drop-${dropFixtureId}.txt`,
+);
+const droppedImagePath = path.join(userDataPath, `electron-smoke-drop-${dropFixtureId}.png`);
+await writeFile(
+  droppedImagePath,
+  Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=",
+    "base64",
+  ),
+  { flag: "wx" },
+);
+await writeFile(droppedWorkspaceFilePath, "Electron smoke dropped workspace file.\n", {
+  encoding: "utf8",
+  flag: "wx",
+});
 await writeSmokeSettings(userDataPath, mockApi.rootBaseUrl);
 
 const childEnvironment = { ...process.env };
@@ -140,7 +158,6 @@ try {
     }
     const resolvedBaseUrl = baseUrlInput?.value ?? "missing";
     const modelItems = [...document.querySelectorAll(".model-catalog__item")];
-    const smokeModelItems = modelItems.filter((item) => item.textContent.includes("smoke-model-"));
     const modelSelect = document.querySelector("#grok-model");
     setSelectValue(modelSelect, "smoke-model-b");
     stage = "selected model state";
@@ -162,7 +179,7 @@ try {
       initialBaseUrl,
       apiKeyInitiallyEmpty,
       resolvedBaseUrl,
-      models: smokeModelItems.map((item) => ({
+      models: modelItems.map((item) => ({
         text: item.textContent.trim(),
         enabled: item.querySelector("input")?.checked ?? false,
       })),
@@ -177,7 +194,7 @@ try {
   assert.equal(connectionSetup.initialBaseUrl, mockApi.rootBaseUrl);
   assert.equal(connectionSetup.apiKeyInitiallyEmpty, true);
   assert.equal(connectionSetup.resolvedBaseUrl, mockApi.versionedBaseUrl);
-  assert.equal(connectionSetup.models.length, 2);
+  assert.equal(connectionSetup.models.length, 2, JSON.stringify(connectionSetup.models));
   assert.equal(connectionSetup.models.every((model) => model.enabled), true);
   assert.equal(connectionSetup.selectedModel, "smoke-model-b");
   assert.equal(connectionSetup.composerModel, "smoke-model-b");
@@ -282,7 +299,7 @@ try {
       setter?.call(element, value);
       element?.dispatchEvent(new Event("input", { bubbles: true }));
     };
-    await window.grokDesktop.createSession("Electron smoke slash commands");
+    const session = await window.grokDesktop.createSession("Electron smoke slash commands");
     await waitFor(() => document.querySelector(".conversation-header h1")?.textContent.includes("Electron smoke"));
     const composer = document.querySelector('.composer textarea[aria-label="给 Grok 发送任务"]');
     setTextareaValue(composer, "/");
@@ -297,6 +314,12 @@ try {
       commands,
       heading: document.querySelector(".composer-commands__heading")?.textContent.trim() ?? "",
       scrollable: (menu?.scrollHeight ?? 0) > (menu?.clientHeight ?? 0),
+      runtimeModelIds: (await window.grokDesktop.syncRuntime()).runtime.availableModels.map(
+        (model) => model.id,
+      ),
+      sessionModelIds: session.configOptions.flatMap((option) =>
+        option.category === "model" ? (option.options ?? []).map((value) => value.value) : []
+      ),
     };
     setTextareaValue(composer, "");
     return result;
@@ -308,6 +331,85 @@ try {
   }
   assert.match(slashCommands.heading, new RegExp(`^命令${slashCommands.count} 个`, "u"));
   assert.equal(slashCommands.scrollable, true);
+  assert.deepEqual(slashCommands.runtimeModelIds, ["smoke-model-a", "smoke-model-b"]);
+  assert.equal(slashCommands.sessionModelIds.every(
+    (modelId) => slashCommands.runtimeModelIds.includes(modelId),
+  ), true, JSON.stringify(slashCommands.sessionModelIds));
+
+  const dropPoint = await cdp.evaluate(`(() => {
+    const target = document.querySelector(".composer");
+    if (!target) throw new Error("Composer was not available for file drop");
+    const rect = target.getBoundingClientRect();
+    return {
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+    };
+  })()`);
+  const dragData = {
+    items: [],
+    files: [droppedImagePath, droppedWorkspaceFilePath],
+    dragOperationsMask: 1,
+  };
+  await cdp.send("Input.dispatchDragEvent", {
+    type: "dragEnter",
+    ...dropPoint,
+    data: dragData,
+  });
+  assert.equal(
+    await cdp.evaluate('Boolean(document.querySelector(".drop-plane"))'),
+    true,
+    "Trusted file drag did not activate the drop plane",
+  );
+  await cdp.send("Input.dispatchDragEvent", {
+    type: "dragOver",
+    ...dropPoint,
+    data: dragData,
+  });
+  await cdp.send("Input.dispatchDragEvent", {
+    type: "drop",
+    ...dropPoint,
+    data: dragData,
+  });
+
+  const droppedAttachments = await cdp.evaluate(`(async () => {
+    const waitFor = async (predicate, timeout = 10000) => {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > timeout) {
+          throw new Error("Timed out waiting for dropped file attachments");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    };
+    await waitFor(() => document.querySelectorAll(".composer-context__file").length === 2);
+    const runtime = (await window.grokDesktop.syncRuntime()).runtime;
+    return {
+      imageCapability: runtime.capabilities.prompt.image,
+      attachments: [...document.querySelectorAll(".composer-context__file")].map((item) => ({
+        path: item.getAttribute("title") ?? "",
+        image: item.classList.contains("is-image"),
+      })),
+      ignoredImageNoticeCount: [...document.querySelectorAll(".toast")].filter(
+        (toast) => toast.textContent.includes("已忽略") && toast.textContent.includes("图片"),
+      ).length,
+    };
+  })()`);
+
+  assert.equal(droppedAttachments.imageCapability, false);
+  assert.deepEqual(
+    droppedAttachments.attachments.map((attachment) => attachment.path).sort(),
+    [droppedImagePath, droppedWorkspaceFilePath].sort(),
+  );
+  assert.equal(droppedAttachments.attachments.filter((attachment) => attachment.image).length, 1);
+  assert.equal(droppedAttachments.ignoredImageNoticeCount, 0);
+  await cdp.evaluate(`(async () => {
+    for (const button of document.querySelectorAll(".composer-context__file button")) {
+      button.click();
+    }
+    while (document.querySelector(".composer-context__file")) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  })()`);
 
   const historyRecovery = await cdp.evaluate(`(async () => {
     const waitFor = async (predicate, timeout = 35000) => {
@@ -617,6 +719,7 @@ try {
     connectionSetup,
     credentialRestart,
     slashCommands,
+    droppedAttachments,
     permissionVisual,
     permissionNarrow,
     permissionControl,
@@ -639,6 +742,7 @@ try {
     await terminateProcessTree(appProcess.pid);
     await waitForProcessExit(appProcess, 5_000);
   }
+  await rm(droppedWorkspaceFilePath, { force: true });
   await mockApi.close();
   if (passed && !KEEP_USER_DATA) {
     assertSafeTemporaryUserDataPath(userDataPath);

@@ -13,6 +13,7 @@ import {
   assertAdvertisedModelSelection,
   assertAdvertisedReasoningEffort,
   assertStdioMcpExecutionApproved,
+  constrainAdvertisedModelState,
   GrokRuntime,
   mcpEnvironmentMaskFromLaunch,
   outcomeFromStopReason,
@@ -716,6 +717,16 @@ describe("Grok prompt usage", () => {
       }
       throw new Error(`Unexpected method: ${method}`);
     });
+    const snapshot = runtime.getSnapshot();
+    Object.assign(runtime as object, {
+      snapshot: {
+        ...snapshot,
+        capabilities: {
+          ...snapshot.capabilities,
+          prompt: { ...snapshot.capabilities.prompt, image: true },
+        },
+      },
+    });
 
     await runtime.createSession("Image test");
     const imagePath = path.join("D:\\project", "diagram.png");
@@ -745,6 +756,50 @@ describe("Grok prompt usage", () => {
         },
       ],
     });
+  });
+
+  it("falls back to ACP resource links when Grok does not advertise image prompts", async () => {
+    let promptParams: Record<string, unknown> | undefined;
+    const runtime = new GrokRuntime(() => undefined, {
+      createId: () => "turn-image-resource-link",
+    });
+    attachFakeAgent(runtime, async (method, params) => {
+      if (method === "session/new") return { sessionId: "session-image-resource-link" };
+      if (method === "session/prompt") {
+        promptParams = params as Record<string, unknown>;
+        return { stopReason: "end_turn" };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await runtime.createSession("Image resource-link fallback");
+    const imagePath = path.join("D:\\project", "diagram.png");
+    await runtime.prompt({
+      sessionId: "session-image-resource-link",
+      text: "Review this image",
+      contextPaths: [imagePath],
+    }, [], [{
+      path: imagePath,
+      name: "diagram.png",
+      relativePath: "diagram.png",
+      size: 8,
+      kind: "image",
+      mimeType: "image/png",
+      data: "base64-must-not-be-sent",
+    }]);
+
+    expect(promptParams).toEqual({
+      sessionId: "session-image-resource-link",
+      prompt: [
+        { type: "text", text: "Review this image" },
+        {
+          type: "resource_link",
+          uri: pathToFileURL(imagePath).href,
+          name: "diagram.png",
+        },
+      ],
+    });
+    expect(JSON.stringify(promptParams)).not.toContain("base64-must-not-be-sent");
   });
 
   it("removes embedded file bodies before prompt echoes cross into the renderer", async () => {
@@ -870,6 +925,237 @@ describe("Grok model selection boundary", () => {
     sessionExecutions: [],
     message: null,
   };
+
+  it("prevents a configured Grok home from expanding the isolated discovery catalog", () => {
+    expect(constrainAdvertisedModelState({
+      currentModelId: "jbbtoken-grok-45",
+      availableModels: [
+        { id: "smoke-model-a", name: "smoke-model-a" },
+        { id: "smoke-model-b", name: "smoke-model-b" },
+        { id: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+        { id: "grok-build", name: "grok-4.5" },
+      ],
+    }, [
+      { id: "smoke-model-a", name: "smoke-model-a" },
+      { id: "smoke-model-b", name: "smoke-model-b" },
+    ], null)).toEqual({
+      currentModelId: null,
+      availableModels: [
+        { id: "smoke-model-a", name: "smoke-model-a" },
+        { id: "smoke-model-b", name: "smoke-model-b" },
+      ],
+    });
+  });
+
+  it("fails closed when the selected isolated model disappears before connection", () => {
+    expect(() => constrainAdvertisedModelState({
+      currentModelId: "local-alias",
+      availableModels: [{ id: "local-alias", name: "Local alias" }],
+    }, [
+      { id: "smoke-model-a", name: "smoke-model-a" },
+    ], "smoke-model-a")).toThrow(/did not confirm/u);
+  });
+
+  it("fails closed when Grok activates a local alias instead of the requested model", () => {
+    expect(() => constrainAdvertisedModelState({
+      currentModelId: "jbbtoken-grok-45",
+      availableModels: [
+        { id: "smoke-model-a", name: "smoke-model-a" },
+        { id: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+      ],
+    }, [
+      { id: "smoke-model-a", name: "smoke-model-a" },
+    ], "smoke-model-a")).toThrow(/did not activate/u);
+  });
+
+  it("fails closed when Grok omits the active model after selection", () => {
+    expect(() => constrainAdvertisedModelState({
+      currentModelId: null,
+      availableModels: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+    }, [
+      { id: "smoke-model-a", name: "smoke-model-a" },
+    ], "smoke-model-a")).toThrow(/did not activate/u);
+  });
+
+  it("rejects a same-id model whose target metadata differs from isolated discovery", () => {
+    expect(() => constrainAdvertisedModelState({
+      currentModelId: "smoke-model-a",
+      availableModels: [{ id: "smoke-model-a", name: "JBBToken Same-ID Override" }],
+    }, [
+      { id: "smoke-model-a", name: "smoke-model-a" },
+    ], "smoke-model-a")).toThrow(/did not confirm/u);
+  });
+
+  it("keeps private session model aliases out of the runtime catalog", async () => {
+    const runtime = new GrokRuntime(() => undefined);
+    Object.assign(runtime as object, {
+      modelCatalogAllowlist: [
+        { id: "smoke-model-a", name: "smoke-model-a" },
+        { id: "smoke-model-b", name: "smoke-model-b" },
+      ],
+      snapshot: {
+        ...runtime.getSnapshot(),
+        currentModelId: "smoke-model-a",
+        availableModels: [
+          { id: "smoke-model-a", name: "smoke-model-a" },
+          { id: "smoke-model-b", name: "smoke-model-b" },
+        ],
+      },
+    });
+    attachFakeAgent(runtime, async (method) => {
+      if (method !== "session/new") throw new Error(`Unexpected method: ${method}`);
+      return {
+        sessionId: "session-private-model-alias",
+        _meta: {
+          modelState: {
+            currentModelId: "smoke-model-a",
+            availableModels: [
+              { modelId: "smoke-model-a", name: "smoke-model-a" },
+              { modelId: "smoke-model-b", name: "smoke-model-b" },
+              { modelId: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" },
+              { modelId: "grok-build", name: "grok-4.5" },
+            ],
+          },
+          "x.ai/sessionConfig": {
+            options: [{
+              id: "jbbtoken-grok-45",
+              category: "model",
+              label: "JBBToken Grok 4.5",
+              selected: true,
+            }],
+          },
+        },
+      };
+    });
+
+    const session = await runtime.createSession("Private model alias boundary");
+
+    expect(session.configOptions).toEqual([]);
+    expect(runtime.getSnapshot()).toMatchObject({
+      currentModelId: "smoke-model-a",
+      availableModels: [
+        { id: "smoke-model-a", name: "smoke-model-a" },
+        { id: "smoke-model-b", name: "smoke-model-b" },
+      ],
+    });
+  });
+
+  it("rejects a session that explicitly switches outside the discovery catalog", async () => {
+    const runtime = new GrokRuntime(() => undefined);
+    Object.assign(runtime as object, {
+      modelCatalogAllowlist: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+      snapshot: {
+        ...runtime.getSnapshot(),
+        currentModelId: "smoke-model-a",
+        availableModels: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+      },
+    });
+    attachFakeAgent(runtime, async (method) => {
+      if (method !== "session/new") throw new Error(`Unexpected method: ${method}`);
+      return {
+        sessionId: "session-outside-model-catalog",
+        _meta: {
+          modelState: {
+            currentModelId: "jbbtoken-grok-45",
+            availableModels: [{
+              modelId: "jbbtoken-grok-45",
+              name: "JBBToken Grok 4.5",
+            }],
+          },
+        },
+      };
+    });
+
+    await expect(runtime.createSession("Outside model catalog")).rejects.toThrow(
+      /outside the isolated discovery catalog/u,
+    );
+    expect(runtime.getSnapshot().phase).toBe("error");
+  });
+
+  it("terminates the runtime when a session update switches outside the catalog", async () => {
+    const events: DesktopEvent[] = [];
+    const runtime = new GrokRuntime((event) => events.push(event));
+    Object.assign(runtime as object, {
+      modelCatalogAllowlist: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+      snapshot: {
+        ...runtime.getSnapshot(),
+        currentModelId: "smoke-model-a",
+        availableModels: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+      },
+    });
+    attachFakeAgent(runtime, async (method) => {
+      if (method === "session/new") return { sessionId: "session-model-update-boundary" };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    await runtime.createSession("Model update boundary");
+    events.length = 0;
+
+    emitFakeUpdate(runtime, "session-model-update-boundary", {
+      sessionUpdate: "config_option_update",
+      configOptions: [{
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "jbbtoken-grok-45",
+        category: "model",
+        options: [{ value: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" }],
+      }],
+    });
+
+    expect(runtime.getSnapshot().phase).toBe("error");
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "notice",
+      level: "error",
+    }));
+  });
+
+  it("terminates the runtime when a config response switches outside the catalog", async () => {
+    const runtime = new GrokRuntime(() => undefined);
+    Object.assign(runtime as object, {
+      modelCatalogAllowlist: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+      snapshot: {
+        ...runtime.getSnapshot(),
+        currentModelId: "smoke-model-a",
+        availableModels: [{ id: "smoke-model-a", name: "smoke-model-a" }],
+      },
+    });
+    attachFakeAgent(runtime, async (method) => {
+      if (method === "session/new") {
+        return {
+          sessionId: "session-config-response-boundary",
+          configOptions: [{
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "smoke-model-a",
+            category: "model",
+            options: [{ value: "smoke-model-a", name: "smoke-model-a" }],
+          }],
+        };
+      }
+      if (method === "session/set_config_option") {
+        return {
+          configOptions: [{
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "jbbtoken-grok-45",
+            category: "model",
+            options: [{ value: "jbbtoken-grok-45", name: "JBBToken Grok 4.5" }],
+          }],
+        };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    await runtime.createSession("Config response boundary");
+
+    await expect(runtime.setSessionConfig(
+      "session-config-response-boundary",
+      "model",
+      "smoke-model-a",
+    )).rejects.toThrow(/outside the isolated discovery catalog/u);
+    expect(runtime.getSnapshot().phase).toBe("error");
+  });
 
   it("accepts only a model advertised by the same Grok executable", () => {
     expect(() => assertAdvertisedModelSelection(

@@ -4,7 +4,7 @@
 `grok.exe`，而是在运行时发现现有安装，并通过 Grok 官方 Agent Client Protocol
 （ACP）建立结构化连接。
 
-> 当前版本：`0.1.4` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
+> 当前版本：`0.1.6` 内测版。核心功能、自动化测试和 Windows 安装包已经可用；安装包
 > 尚未进行 Windows 代码签名，公开分发时可能触发 SmartScreen 的未知发布者提示。
 
 源码与版本说明托管在 GitHub；Windows 安装包通过

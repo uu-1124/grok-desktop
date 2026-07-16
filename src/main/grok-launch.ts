@@ -3,8 +3,10 @@ import {
   normalizeXaiApiKey,
 } from "../shared/xai-connection.js";
 import type { PermissionModePreference } from "../shared/contracts.js";
+import path from "node:path";
 
 const MAX_MODEL_ID_LENGTH = 1_024;
+const MAX_PATH_LENGTH = 32_767;
 const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
 const SHORT_SENSITIVE_VALUE_LENGTH = 4;
 const GROK_CONNECTION_ENVIRONMENT_VARIABLES = new Set([
@@ -153,6 +155,7 @@ export interface GrokAgentLaunchOptions {
   permissionMode: PermissionModePreference;
   xaiApiBaseUrl: string;
   xaiApiKey: string;
+  grokHome?: string | null;
 }
 
 export interface GrokAgentLaunch {
@@ -174,6 +177,7 @@ export function buildGrokAgentLaunch(
   }
   const modelId = normalizeModelId(options.modelId);
   const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort ?? null);
+  const grokHome = normalizeGrokHome(options.grokHome ?? null);
   assertLaunchControlDoesNotContainCredential(modelId, "modelId", xaiApiKey);
   assertLaunchControlDoesNotContainCredential(
     reasoningEffort,
@@ -215,9 +219,33 @@ export function buildGrokAgentLaunch(
       delete env[name];
     }
   }
+  if (grokHome) {
+    for (const name of Object.keys(env)) {
+      if (name.toUpperCase() === "GROK_HOME") {
+        delete env[name];
+      }
+    }
+    env.GROK_HOME = grokHome;
+  }
   env.GROK_MODELS_BASE_URL = xaiApiBaseUrl;
   env.XAI_API_KEY = xaiApiKey;
   return { args, env };
+}
+
+function normalizeGrokHome(value: string | null): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.length > MAX_PATH_LENGTH ||
+    CONTROL_CHARACTER_PATTERN.test(value) ||
+    !path.isAbsolute(value)
+  ) {
+    throw new TypeError("grokHome must be an absolute path without control characters.");
+  }
+  return value;
 }
 
 function normalizePermissionMode(value: unknown): PermissionModePreference {

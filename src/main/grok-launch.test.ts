@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
 
 import {
   normalizeXaiApiBaseUrl,
@@ -142,6 +143,35 @@ describe("Grok agent launch", () => {
         ["XAI_API_KEY", "child-test-key"],
       ]);
     expect(parentEnv).toEqual(originalParentEnv);
+  });
+
+  it("isolates Grok configuration only when an explicit discovery home is supplied", () => {
+    const isolatedHome = path.resolve("temporary-grok-discovery-home");
+    const parentEnv: NodeJS.ProcessEnv = {
+      GROK_HOME: path.resolve("user-grok-home"),
+      Grok_Home: path.resolve("mixed-case-user-grok-home"),
+    };
+
+    const launch = buildGrokAgentLaunch({
+      modelId: null,
+      permissionMode: "default",
+      grokHome: isolatedHome,
+      ...explicitConnection,
+    }, parentEnv);
+
+    expect(Object.entries(launch.env).filter(
+      ([name]) => name.toUpperCase() === "GROK_HOME",
+    )).toEqual([["GROK_HOME", isolatedHome]]);
+    expect(parentEnv).toHaveProperty("Grok_Home");
+  });
+
+  it("rejects a relative Grok discovery home", () => {
+    expect(() => buildGrokAgentLaunch({
+      modelId: null,
+      permissionMode: "default",
+      grokHome: "relative-grok-home",
+      ...explicitConnection,
+    })).toThrow(/grokHome/u);
   });
 
   it.each([

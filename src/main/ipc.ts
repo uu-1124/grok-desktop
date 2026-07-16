@@ -429,7 +429,10 @@ export function registerIpcHandlers({
         const installation = await resolveTrustedInstallation(request.executablePath);
         const credentials = await resolveXaiCredentials(request);
         return await discoverXaiModels(
-          () => new GrokRuntime(() => undefined, { connectTimeoutMs: 10_000 }),
+          (grokHome) => new GrokRuntime(() => undefined, {
+            connectTimeoutMs: 10_000,
+            grokHome,
+          }),
           {
             workspacePath,
             executablePath: installation.executablePath,
@@ -528,7 +531,10 @@ export function registerIpcHandlers({
       }
 
       const snapshot = await connectWithXaiApiDiscovery(
-        () => new GrokRuntime(() => undefined, { connectTimeoutMs: 10_000 }),
+        (grokHome) => new GrokRuntime(() => undefined, {
+          connectTimeoutMs: 10_000,
+          grokHome,
+        }),
         runtime,
         normalizedRequest,
       );
@@ -634,12 +640,6 @@ export function registerIpcHandlers({
       );
       const imageReferences = references.filter((reference) => reference.kind === "image");
       const fileReferences = references.filter((reference) => reference.kind === "file");
-      if (
-        imageReferences.length > 0 &&
-        !runtime.getSnapshot().capabilities.prompt.image
-      ) {
-        throw new Error("当前 Grok 未声明图片输入能力，无法发送图片附件。");
-      }
       const preparedContextFiles = await preparePromptContextFiles(
         fileReferences,
         runtime.getSnapshot().capabilities.prompt.embeddedContext,

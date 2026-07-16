@@ -1602,7 +1602,8 @@ function App() {
     canUseSession &&
     mainView === "conversation" &&
     !settingsOpen &&
-    !permission,
+    !permission &&
+    !dropBusy,
   );
 
   useEffect(() => {
@@ -2133,26 +2134,12 @@ function App() {
     try {
       const selected = await window.grokDesktop.chooseContextFiles(workspacePath);
       if (selected.length > 0) {
-        const unsupportedImages = selected.filter((file) =>
-          file.kind === "image" && !runtime.capabilities.prompt.image
-        );
-        const accepted = selected.filter((file) =>
-          file.kind !== "image" || runtime.capabilities.prompt.image
-        );
-        if (unsupportedImages.length > 0) {
-          pushNotice(
-            `当前 Grok 未声明图片输入能力，已忽略 ${unsupportedImages.length} 张图片。`,
-            "warning",
-          );
-        }
-        if (accepted.length > 0) {
-          setContextFiles((current) => mergeContextFiles(current, accepted));
-        }
+        setContextFiles((current) => mergeContextFiles(current, selected));
       }
     } catch (error) {
       pushNotice(userFacingErrorMessage(error, "无法引用工作区文件"), "error");
     }
-  }, [canUseSession, pushNotice, runtime.capabilities.prompt.image, setContextFiles, workspacePath]);
+  }, [canUseSession, pushNotice, setContextFiles, workspacePath]);
 
   const handleFileDragEnter = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
     if (!Array.from(event.dataTransfer.types).includes("Files")) return;
@@ -2179,6 +2166,8 @@ function App() {
     event.preventDefault();
     dragDepth.current = 0;
     setDropActive(false);
+
+    if (dropBusy) return;
 
     if (!workspacePath) {
       pushNotice("请先连接一个工作区，再拖入附件。", "warning");
@@ -2214,21 +2203,9 @@ function App() {
         throw new Error("拖入的内容不是可读取的本地文件。");
       }
       const resolved = await window.grokDesktop.resolveDroppedFiles(workspacePath, filePaths);
-      const unsupportedImages = resolved.filter((file) =>
-        file.kind === "image" && !runtime.capabilities.prompt.image
-      );
-      const accepted = resolved.filter((file) =>
-        file.kind !== "image" || runtime.capabilities.prompt.image
-      );
-      if (unsupportedImages.length > 0) {
-        pushNotice(
-          `当前 Grok 未声明图片输入能力，已忽略 ${unsupportedImages.length} 张图片。`,
-          "warning",
-        );
-      }
-      if (accepted.length > 0) {
-        setContextFiles((current) => mergeContextFiles(current, accepted));
-        pushNotice(`已添加 ${accepted.length} 个附件。`);
+      if (resolved.length > 0) {
+        setContextFiles((current) => mergeContextFiles(current, resolved));
+        pushNotice(`已添加 ${resolved.length} 个附件。`);
       }
     } catch (error) {
       pushNotice(userFacingErrorMessage(error, "无法添加拖入的附件"), "error");
@@ -2236,7 +2213,7 @@ function App() {
       setDropBusy(false);
       setDropActive(false);
     }
-  }, [canUseSession, mainView, permission, pushNotice, runtime.capabilities.prompt.image, setContextFiles, settingsOpen, workspacePath]);
+  }, [canUseSession, dropBusy, mainView, permission, pushNotice, setContextFiles, settingsOpen, workspacePath]);
 
   const submitPrompt = useCallback(async (textOverride?: string) => {
     const text = (textOverride ?? composer).trim();
@@ -2552,7 +2529,9 @@ function App() {
           <div className="drop-plane__content">
             <span><ImageIcon size={24}/><FileIcon size={21}/></span>
             <strong>{dropBusy ? "正在验证附件" : "释放以添加到当前任务"}</strong>
-            <small>图片将作为视觉输入，其他文件将作为工作区上下文</small>
+            <small>{runtime.capabilities.prompt.image
+              ? "图片将作为视觉输入，其他文件将作为工作区上下文"
+              : "图片将作为文件引用，其他文件将作为工作区上下文"}</small>
           </div>
         </div>
       )}

@@ -95,8 +95,8 @@ export function parseReportedMcpServerCount(value: unknown): ReportedMcpServerSu
 }
 
 /**
- * Normalizes standard ACP session data and Grok's x.ai session metadata into
- * renderer-safe DTOs. Unknown metadata is deliberately discarded.
+ * Normalizes standard ACP session data, allow-listed Grok model state, and the
+ * legacy read-only Grok session selector into renderer-safe DTOs.
  */
 export function parseSessionCapabilities(value: unknown): ParsedSessionCapabilities {
   const record = asRecord(value);
@@ -114,7 +114,7 @@ export function parseSessionCapabilities(value: unknown): ParsedSessionCapabilit
   );
   const metadata = asRecord(record._meta);
   const xaiSessionConfig = asRecord(metadata?.["x.ai/sessionConfig"]);
-  const extensionOptions = parseExtensionModelOptions(xaiSessionConfig?.options);
+  const extensionModels = parseExtensionModelOptions(xaiSessionConfig?.options);
   const models = parseModels(
     record.models ??
       firstDefined(
@@ -123,26 +123,87 @@ export function parseSessionCapabilities(value: unknown): ParsedSessionCapabilit
       ),
   );
 
+  const initialModelId = models.currentModelId ?? currentModelFromConfig(standardOptions);
+  const hasStandardModelOption = standardOptions.some(
+    (option) => option.type === "select" && option.category === "model",
+  );
+  const hasModelConfigId = standardOptions.some((option) => option.id === "model");
   const extensionCurrentModelId = selectedExtensionModelId(xaiSessionConfig);
-  const initialModelId =
-    models.currentModelId ?? extensionCurrentModelId ?? extensionOptions[0]?.id ?? null;
-  const configOptions = standardOptions.length > 0
+  const configOptions = hasStandardModelOption || hasModelConfigId || extensionModels.length === 0
     ? standardOptions
-      : extensionOptions.length > 0
-      ? [createModelConfigOption(extensionOptions, initialModelId)]
-      : [];
-  const optionModels = extractModelsFromConfigOptions(configOptions);
+    : [
+        ...standardOptions,
+        createModelConfigOption(
+          extensionModels,
+          extensionCurrentModelId ?? extensionModels[0]?.id ?? null,
+        ),
+      ];
+  const optionModels = extractModelsFromConfigOptions(standardOptions);
   const availableModels = deduplicateModels([
     ...models.availableModels,
     ...optionModels,
-    ...extensionOptions,
   ]);
-  const currentModelId = models.currentModelId ?? currentModelFromConfig(configOptions) ?? initialModelId;
+  const currentModelId = initialModelId;
 
   return {
     configOptions,
     availableModels,
     currentModelId,
+  };
+}
+
+export function constrainSessionCapabilitiesToModels(
+  capabilities: ParsedSessionCapabilities,
+  allowedModels: readonly ModelInfo[],
+): ParsedSessionCapabilities {
+  const allowedById = new Map(allowedModels.map((model) => [model.id, model]));
+  const allowedIds = new Set(allowedById.keys());
+  const reportedIds = new Set(capabilities.availableModels.map((model) => model.id));
+  const configOptions = capabilities.configOptions.flatMap((option): SessionConfigOption[] => {
+    if (!isModelConfigOption(option)) {
+      return [{
+        ...option,
+        ...(option.options
+          ? { options: option.options.map((value) => ({ ...value })) }
+          : {}),
+      }];
+    }
+    if (option.type !== "select" || typeof option.currentValue !== "string") {
+      return [];
+    }
+    const options = (option.options ?? []).flatMap((value): SessionConfigValue[] => {
+      const model = allowedById.get(value.value);
+      return model
+        ? [{
+            value: model.id,
+            name: model.name,
+            ...(model.description ? { description: model.description } : {}),
+          }]
+        : [];
+    });
+    if (!allowedIds.has(option.currentValue) || !options.some(
+      (value) => value.value === option.currentValue,
+    )) {
+      return [];
+    }
+    return [{
+      ...option,
+      options: options.map((value) => ({ ...value })),
+    }];
+  });
+  return {
+    configOptions,
+    availableModels: allowedModels
+      .filter((model) => reportedIds.has(model.id))
+      .map((model) => ({
+        ...model,
+        ...(model.reasoningEfforts
+          ? { reasoningEfforts: model.reasoningEfforts.map((effort) => ({ ...effort })) }
+          : {}),
+      })),
+    currentModelId: capabilities.currentModelId && allowedIds.has(capabilities.currentModelId)
+      ? capabilities.currentModelId
+      : null,
   };
 }
 
@@ -228,6 +289,11 @@ function isConfigOptionRecord(value: Record<string, unknown>): boolean {
     (value.type === "select" || value.type === "boolean");
 }
 
+function isModelConfigOption(option: SessionConfigOption): boolean {
+  return option.type === "select" &&
+    (option.category === "model" || option.id === "model");
+}
+
 function parseExtensionModelOptions(value: unknown): ModelInfo[] {
   if (!Array.isArray(value)) {
     return [];
@@ -237,12 +303,12 @@ function parseExtensionModelOptions(value: unknown): ModelInfo[] {
     if (option?.category !== "model") {
       return [];
     }
-    const id = normalizeText(option?.id ?? option?.modelId ?? option?.value, MAX_ID_LENGTH);
+    const id = normalizeText(option.id ?? option.modelId ?? option.value, MAX_ID_LENGTH);
     if (!id) {
       return [];
     }
-    const name = normalizeText(option?.label ?? option?.name ?? option?.title, MAX_TEXT_LENGTH) ?? id;
-    const description = normalizeText(option?.description, MAX_TEXT_LENGTH);
+    const name = normalizeText(option.label ?? option.name ?? option.title, MAX_TEXT_LENGTH) ?? id;
+    const description = normalizeText(option.description, MAX_TEXT_LENGTH);
     return [{ id, name, ...(description ? { description } : {}) }];
   });
 }

@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+## 0.1.6 - 2026-07-16
+
+### Fixed
+
+- Windows 资源管理器拖入的图片和工作区文件现在会真实进入 Composer 附件列表；当前 Grok 未广告 ACP Image block 时，图片经过路径、大小和文件签名校验后降级为 ResourceLink，不再被界面静默丢弃。
+- 模型发现使用隔离的短生命周期 Grok 配置目录，只展示当前 URL + Key 返回的模型，不再把
+  用户 `config.toml` 中的 JBBToken 等本地模型别名合并到上游目录。
+- 正式 Runtime 在初始化、会话创建、会话恢复和配置更新期间持续执行同一模型 allow-list，
+  并在 Grok 未实际激活所选模型时安全失败。
+
+### Security
+
+- 每个同源 API 候选使用独立临时 `GROK_HOME`，Grok 子进程退出后立即校验路径并递归清理；
+  Electron smoke 会在模型目录出现任何额外项或会话更新重新引入别名时失败。
+
 ## 0.1.3 - 2026-07-15
 
 ### Added

@@ -66,18 +66,20 @@ import {
   redactSerializableSecrets,
 } from "./grok-launch.js";
 import {
+  constrainSessionCapabilitiesToModels,
   parseAgentCapabilities,
   parseAvailableCommands,
   parseReportedMcpServerCount,
   parseSessionCapabilities,
 } from "./acp-capabilities.js";
+import type { ParsedSessionCapabilities } from "./acp-capabilities.js";
 import type {
   PreparedPromptContextFile,
   PreparedPromptImage,
 } from "./workspace-files.js";
 
 const CLIENT_NAME = "Grok Desktop";
-const CLIENT_VERSION = "0.1.4";
+const CLIENT_VERSION = "0.1.6";
 const CONNECT_TIMEOUT_MS = 20_000;
 const SPAWN_TIMEOUT_MS = 5_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
@@ -126,12 +128,17 @@ interface ActiveCancellation {
   promise: Promise<void>;
 }
 
+class ModelCatalogViolationError extends Error {
+  override readonly name = "ModelCatalogViolationError";
+}
+
 export interface GrokRuntimeOptions {
   permissionTimeoutMs?: number;
   cancelTimeoutMs?: number;
   connectTimeoutMs?: number;
   now?: () => Date;
   createId?: () => string;
+  grokHome?: string;
 }
 
 /**
@@ -147,6 +154,7 @@ export class GrokRuntime {
   private readonly connectTimeoutMs: number;
   private readonly now: () => Date;
   private readonly createId: () => string;
+  private readonly grokHome: string | null;
 
   private snapshot: RuntimeSnapshot = createOfflineSnapshot();
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -157,6 +165,7 @@ export class GrokRuntime {
   private xaiApiKey: string | null = null;
   private xaiApiKeyConfigured = false;
   private mcpServers: McpServerConfig[] = [];
+  private modelCatalogAllowlist: ModelInfo[] | null = null;
   /** Names only; values from the Grok launch environment are never duplicated here. */
   private mcpInheritedEnvironment: Readonly<Record<string, string | undefined>> = {};
   private connectInProgress = false;
@@ -196,6 +205,7 @@ export class GrokRuntime {
     );
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
+    this.grokHome = options.grokHome ?? null;
   }
 
   getSnapshot(): RuntimeSnapshot {
@@ -291,6 +301,9 @@ export class GrokRuntime {
       }
 
       generation = ++this.lifecycleGeneration;
+      this.modelCatalogAllowlist = advertisedModels
+        ? advertisedModels.map(cloneModelInfo)
+        : null;
       this.stderrTail = "";
       this.xaiApiKeyConfigured = normalized.xaiApiKey !== undefined;
       this.xaiApiKey = normalized.xaiApiKey;
@@ -325,7 +338,10 @@ export class GrokRuntime {
         message: "Starting the local Grok agent...",
       });
 
-      const launch = buildGrokAgentLaunch(normalized);
+      const launch = buildGrokAgentLaunch({
+        ...normalized,
+        grokHome: this.grokHome,
+      });
       const child = spawn(normalized.executablePath, launch.args, {
         cwd: normalized.workspacePath,
         env: launch.env,
@@ -398,7 +414,18 @@ export class GrokRuntime {
 
       this.assertCurrentGeneration(generation);
       assertSupportedProtocol(initialization.protocolVersion);
-      const initializationState = parseInitialization(initialization, normalized.modelId);
+      const parsedInitializationState = parseInitialization(initialization);
+      const modelState = advertisedModels
+        ? constrainAdvertisedModelState(
+            parsedInitializationState,
+            advertisedModels,
+            normalized.modelId,
+          )
+        : parsedInitializationState;
+      const initializationState = {
+        ...parsedInitializationState,
+        ...modelState,
+      };
       assertModelMetadataDoesNotContainCredentials(
         initializationState,
         normalized.xaiApiKey,
@@ -484,12 +511,14 @@ export class GrokRuntime {
         cwd: workspacePath,
         mcpServers,
       });
-      this.applySessionCapabilities(response);
+      const capabilities = this.parseSessionCapabilities(response);
+      this.applyParsedSessionCapabilities(capabilities);
       const session = createSessionState(
         response.sessionId,
         titleFromResponse(response) ?? normalizedTitle,
         response,
         false,
+        capabilities,
       );
       this.sessions.set(session.sessionId, session);
       this.ensureExecution(session.sessionId);
@@ -502,6 +531,9 @@ export class GrokRuntime {
       this.emitEvent({ type: "session-ready", payload });
       return cloneSessionReadyPayload(payload);
     } catch (error: unknown) {
+      if (error instanceof ModelCatalogViolationError) {
+        this.failRuntime(error.message);
+      }
       throw toRuntimeError("Unable to create a Grok session", error, "", sensitiveValues);
     }
   }
@@ -547,7 +579,8 @@ export class GrokRuntime {
         cwd: workspacePath,
         mcpServers,
       });
-      this.applySessionCapabilities(response);
+      const capabilities = this.parseSessionCapabilities(response);
+      this.applyParsedSessionCapabilities(capabilities);
       const latest = this.sessions.get(normalizedSessionId) ?? provisional;
       const responseTitle = titleFromResponse(response);
       const session = mergeSessionState(
@@ -555,6 +588,7 @@ export class GrokRuntime {
         responseTitle ?? latest.title,
         response,
         true,
+        capabilities,
       );
       this.sessions.set(normalizedSessionId, session);
       this.ensureExecution(normalizedSessionId);
@@ -572,6 +606,9 @@ export class GrokRuntime {
     } catch (error: unknown) {
       this.loadingSessionUpdates.delete(normalizedSessionId);
       this.sessions.delete(normalizedSessionId);
+      if (error instanceof ModelCatalogViolationError) {
+        this.failRuntime(error.message);
+      }
       throw toRuntimeError("Unable to load the Grok session", error, "", sensitiveValues);
     }
   }
@@ -623,6 +660,7 @@ export class GrokRuntime {
           preparedContextFiles,
           preparedImages,
           this.snapshot.capabilities.prompt.embeddedContext,
+          this.snapshot.capabilities.prompt.image,
         ),
       ];
       const response = await agent.request(methods.agent.session.prompt, {
@@ -845,14 +883,24 @@ export class GrokRuntime {
     if (option.readOnly) {
       throw new Error(`Grok session configuration option is read-only: ${normalizedConfigId}`);
     }
+    if (
+      isSessionModelConfigOption(option) &&
+      typeof value === "string" &&
+      this.modelCatalogAllowlist &&
+      !this.modelCatalogAllowlist.some((model) => model.id === value)
+    ) {
+      throw new Error("The requested session model is outside the isolated discovery catalog.");
+    }
 
     const request = buildConfigRequest(normalizedSessionId, option, value);
+    let responseReceived = false;
     try {
       const response: SetSessionConfigOptionResponse = await agent.request(
         methods.agent.session.setConfigOption,
         request,
       );
-      const capabilities = parseSessionCapabilities(response);
+      responseReceived = true;
+      const capabilities = this.parseSessionCapabilities(response);
       this.applyParsedSessionCapabilities(capabilities);
       session.configOptions = capabilities.configOptions;
       this.emitSyntheticSessionUpdate(normalizedSessionId, {
@@ -860,6 +908,13 @@ export class GrokRuntime {
         configOptions: cloneSerializable(session.configOptions),
       });
     } catch (error: unknown) {
+      if (responseReceived) {
+        this.failRuntime(
+          error instanceof Error
+            ? error.message
+            : "Grok returned an invalid session configuration response.",
+        );
+      }
       throw toRuntimeError(
         "Unable to change the Grok session configuration",
         error,
@@ -966,15 +1021,24 @@ export class GrokRuntime {
         session.currentModeId = update.currentModeId;
       }
     } else if (update.sessionUpdate === "config_option_update") {
-      const capabilities = parseSessionCapabilities(update);
-      this.applyParsedSessionCapabilities(capabilities);
-      if (session) {
-        session.configOptions = capabilities.configOptions;
+      try {
+        const capabilities = this.parseSessionCapabilities(update);
+        this.applyParsedSessionCapabilities(capabilities);
+        if (session) {
+          session.configOptions = capabilities.configOptions;
+        }
+        rendererUpdate = {
+          sessionUpdate: "config_option_update",
+          configOptions: cloneSerializable(capabilities.configOptions),
+        };
+      } catch (error) {
+        this.failRuntime(
+          error instanceof Error
+            ? error.message
+            : "Grok sent an invalid session configuration update.",
+        );
+        return;
       }
-      rendererUpdate = {
-        sessionUpdate: "config_option_update",
-        configOptions: cloneSerializable(capabilities.configOptions),
-      };
     } else if (update.sessionUpdate === "available_commands_update") {
       const availableCommands = parseAvailableCommands(update.availableCommands);
       if (session) {
@@ -1214,13 +1278,28 @@ export class GrokRuntime {
     });
   }
 
-  private applySessionCapabilities(value: unknown): void {
-    this.applyParsedSessionCapabilities(parseSessionCapabilities(value));
+  private parseSessionCapabilities(value: unknown): ParsedSessionCapabilities {
+    const capabilities = parseSessionCapabilities(value);
+    if (
+      this.modelCatalogAllowlist &&
+      capabilities.currentModelId &&
+      !this.modelCatalogAllowlist.some((model) => model.id === capabilities.currentModelId)
+    ) {
+      throw new ModelCatalogViolationError(
+        "Grok session reported a model outside the isolated discovery catalog.",
+      );
+    }
+    return this.modelCatalogAllowlist
+      ? constrainSessionCapabilitiesToModels(capabilities, this.modelCatalogAllowlist)
+      : capabilities;
   }
 
   private applyParsedSessionCapabilities(
-    state: ReturnType<typeof parseSessionCapabilities>,
+    parsedState: ParsedSessionCapabilities,
   ): void {
+    const state = this.modelCatalogAllowlist
+      ? constrainSessionCapabilitiesToModels(parsedState, this.modelCatalogAllowlist)
+      : parsedState;
     if (this.xaiApiKey) {
       assertModelMetadataDoesNotContainCredentials(state, this.xaiApiKey);
     }
@@ -1351,6 +1430,7 @@ export class GrokRuntime {
     this.connection = null;
     this.agent = null;
     this.xaiApiKeyConfigured = false;
+    this.modelCatalogAllowlist = null;
     this.mcpServers = [];
     this.mcpInheritedEnvironment = {};
     this.activePrompts.clear();
@@ -1394,6 +1474,7 @@ export class GrokRuntime {
     this.agent = null;
     this.xaiApiKeyConfigured = false;
     this.xaiApiKey = null;
+    this.modelCatalogAllowlist = null;
     this.mcpServers = [];
     this.mcpInheritedEnvironment = {};
     this.sessions.clear();
@@ -1667,6 +1748,63 @@ export function assertAdvertisedModelSelection(
   }
 }
 
+export function constrainAdvertisedModelState(
+  initialized: Pick<RuntimeSnapshot, "currentModelId" | "availableModels">,
+  advertisedModels: readonly ModelInfo[],
+  requestedModelId: string | null,
+): Pick<RuntimeSnapshot, "currentModelId" | "availableModels"> {
+  const initializedById = new Map(initialized.availableModels.map((model) => [model.id, model]));
+  const seen = new Set<string>();
+  const availableModels = advertisedModels.flatMap((model): ModelInfo[] => {
+    const initializedModel = initializedById.get(model.id);
+    if (
+      seen.has(model.id) ||
+      !initializedModel ||
+      !hasMatchingModelAdvertisement(model, initializedModel)
+    ) {
+      return [];
+    }
+    seen.add(model.id);
+    return [cloneModelInfo(model)];
+  });
+  if (advertisedModels.length > 0 && availableModels.length === 0) {
+    throw new Error("Grok ACP did not confirm any model from the isolated discovery catalog.");
+  }
+  if (requestedModelId) {
+    if (!availableModels.some((model) => model.id === requestedModelId)) {
+      throw new Error("The requested model disappeared after isolated Grok ACP discovery.");
+    }
+    if (initialized.currentModelId !== requestedModelId) {
+      throw new Error("Grok ACP did not activate the model selected from isolated discovery.");
+    }
+  }
+  const currentModelId = requestedModelId ?? (
+    initialized.currentModelId && availableModels.some(
+      (model) => model.id === initialized.currentModelId,
+    )
+      ? initialized.currentModelId
+      : null
+  );
+  return { currentModelId, availableModels };
+}
+
+function hasMatchingModelAdvertisement(left: ModelInfo, right: ModelInfo): boolean {
+  const leftEfforts = left.reasoningEfforts ?? [];
+  const rightEfforts = right.reasoningEfforts ?? [];
+  return left.name === right.name &&
+    (left.description ?? null) === (right.description ?? null) &&
+    (left.reasoningEffort ?? null) === (right.reasoningEffort ?? null) &&
+    leftEfforts.length === rightEfforts.length &&
+    leftEfforts.every((effort, index) => {
+      const candidate = rightEfforts[index];
+      return candidate !== undefined &&
+        effort.id === candidate.id &&
+        effort.name === candidate.name &&
+        (effort.description ?? null) === (candidate.description ?? null) &&
+        effort.isDefault === candidate.isDefault;
+    });
+}
+
 export function assertAdvertisedReasoningEffort(
   reasoningEffort: string | null,
   modelId: string | null,
@@ -1893,6 +2031,7 @@ function createPromptContextBlocks(
   preparedFiles: readonly PreparedPromptContextFile[],
   preparedImages: readonly PreparedPromptImage[],
   allowEmbeddedContext: boolean,
+  allowImageContent: boolean,
 ): ContentBlock[] {
   const contextKeys = new Set(contextPaths.map(contextPathKey));
   const preparedByPath = new Map<string, PreparedPromptContextFile>();
@@ -1916,7 +2055,7 @@ function createPromptContextBlocks(
     const key = contextPathKey(contextPath);
     const preparedImage = preparedImagesByPath.get(key);
     const uri = pathToFileURL(contextPath).href;
-    if (preparedImage) {
+    if (preparedImage && allowImageContent) {
       return {
         type: "image",
         data: preparedImage.data,
@@ -2039,10 +2178,7 @@ function assertModelMetadataDoesNotContainCredentials(
   }
 }
 
-function parseInitialization(
-  response: InitializeResponse,
-  requestedModelId: string | null,
-): {
+function parseInitialization(response: InitializeResponse): {
   grokVersion: string | null;
   currentModelId: string | null;
   availableModels: ModelInfo[];
@@ -2069,7 +2205,7 @@ function parseInitialization(
       readNonEmptyString(agentInfo?.version) ??
       readNonEmptyString(meta?.agentVersion) ??
       null,
-    currentModelId: parsedModels.currentModelId ?? requestedModelId,
+    currentModelId: parsedModels.currentModelId,
     availableModels: parsedModels.availableModels,
     authMethods: parseAuthMethods(raw.authMethods),
     capabilities,
@@ -2101,9 +2237,9 @@ function createSessionState(
   title: string,
   response: NewSessionResponse | LoadSessionResponse,
   loaded: boolean,
+  capabilities: ParsedSessionCapabilities,
 ): SessionState {
   const raw = response as unknown as Record<string, unknown>;
-  const capabilities = parseSessionCapabilities(raw);
   const commands = parseSessionAvailableCommands(raw);
   return {
     sessionId,
@@ -2121,9 +2257,9 @@ function mergeSessionState(
   title: string,
   response: NewSessionResponse | LoadSessionResponse,
   loaded: boolean,
+  capabilities: ParsedSessionCapabilities,
 ): SessionState {
   const raw = response as unknown as Record<string, unknown>;
-  const capabilities = parseSessionCapabilities(raw);
   const commands = parseSessionAvailableCommands(raw);
   return {
     sessionId: state.sessionId,
@@ -2132,12 +2268,17 @@ function mergeSessionState(
     availableModes: response.modes
       ? parseModes(response.modes.availableModes)
       : state.availableModes,
-    configOptions: hasSessionConfigPayload(raw)
+    configOptions: shouldReplaceSessionConfig(raw, capabilities)
       ? capabilities.configOptions
       : state.configOptions,
     availableCommands: commands.present ? commands.commands : state.availableCommands,
     loaded,
   };
+}
+
+function isSessionModelConfigOption(option: SessionConfigOption): boolean {
+  return option.type === "select" &&
+    (option.category === "model" || option.id === "model");
 }
 
 function parseModes(value: unknown): SessionModeOption[] {
@@ -2159,13 +2300,16 @@ function parseModes(value: unknown): SessionModeOption[] {
   });
 }
 
-function hasSessionConfigPayload(response: Record<string, unknown>): boolean {
+function shouldReplaceSessionConfig(
+  response: Record<string, unknown>,
+  capabilities: ParsedSessionCapabilities,
+): boolean {
   if (Array.isArray(response.configOptions)) {
     return true;
   }
   const meta = asRecord(response._meta);
   const extension = asRecord(meta?.["x.ai/sessionConfig"]);
-  return Array.isArray(extension?.options);
+  return Array.isArray(extension?.options) && capabilities.configOptions.length > 0;
 }
 
 function parseSessionAvailableCommands(
