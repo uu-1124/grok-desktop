@@ -44,6 +44,7 @@ export function isPathWithinWorkspace(
 export async function resolveWorkspaceContextFiles(
   workspacePath: string,
   selectedPaths: readonly string[],
+  options: { allowExternalImages?: boolean } = {},
 ): Promise<ContextFileReference[]> {
   if (selectedPaths.length > MAX_PROMPT_CONTEXT_FILES) {
     throw new Error(`一次最多引用 ${MAX_PROMPT_CONTEXT_FILES} 个文件。`);
@@ -69,7 +70,9 @@ export async function resolveWorkspaceContextFiles(
       if (!entry.isFile()) {
         throw new Error("只能引用普通文件。");
       }
-      if (!isPathWithinWorkspace(canonicalWorkspace, canonicalPath)) {
+      const imageMimeType = imageMimeTypeForPath(canonicalPath);
+      if (!isPathWithinWorkspace(canonicalWorkspace, canonicalPath) &&
+        !(options.allowExternalImages && imageMimeType)) {
         throw new Error("只能引用当前工作区内的文件。");
       }
       const key = process.platform === "win32"
@@ -79,7 +82,6 @@ export async function resolveWorkspaceContextFiles(
         continue;
       }
       seen.add(key);
-      const imageMimeType = imageMimeTypeForPath(canonicalPath);
       if (imageMimeType && entry.size > MAX_PROMPT_IMAGE_FILE_BYTES) {
         throw new Error(
           `图片不能超过 ${MAX_PROMPT_IMAGE_FILE_BYTES / 1_024 / 1_024} MiB。`,

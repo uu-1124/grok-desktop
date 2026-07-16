@@ -1275,7 +1275,7 @@ function App() {
         )
       : snapshot.message;
     setRuntime(message === snapshot.message ? snapshot : { ...snapshot, message });
-    if (snapshot.availableModels.length > 0) {
+    {
       const models = snapshot.availableModels.map((model) => ({
         ...model,
         ...(model.reasoningEfforts

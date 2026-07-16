@@ -1868,9 +1868,10 @@ function normalizePromptContextPaths(
       !path.isAbsolute(candidate) ||
       candidate.length > MAX_PATH_LENGTH ||
       candidate.includes("\0") ||
-      !isPathInsideWorkspace(workspacePath, candidate)
+      !isPathInsideWorkspace(workspacePath, candidate) &&
+      !isSupportedExternalImagePath(candidate)
     ) {
-      throw new TypeError("Every prompt context path must be an absolute file inside the current workspace.");
+      throw new TypeError("Every prompt context path must be an absolute file inside the current workspace or a supported image.");
     }
     const key = process.platform === "win32"
       ? candidate.toLocaleLowerCase("en-US")
@@ -1881,6 +1882,10 @@ function normalizePromptContextPaths(
     }
   }
   return normalized;
+}
+
+function isSupportedExternalImagePath(candidate: string): boolean {
+  return /\.(?:gif|jpe?g|png|webp)$/iu.test(candidate);
 }
 
 function createPromptContextBlocks(

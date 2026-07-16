@@ -78,6 +78,28 @@ describe("workspace context files", () => {
     );
   });
 
+  it("allows dropped images outside the workspace but keeps other files scoped", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "grok-desktop-context-"));
+    temporaryPaths.push(root);
+    const workspace = path.join(root, "workspace");
+    const imagePath = path.join(root, "desktop.png");
+    const textPath = path.join(root, "desktop.txt");
+    await mkdir(workspace, { recursive: true });
+    await writeFile(imagePath, new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    await writeFile(textPath, "outside", "utf8");
+
+    await expect(resolveWorkspaceContextFiles(workspace, [imagePath], {
+      allowExternalImages: true,
+    })).resolves.toEqual([expect.objectContaining({
+      path: imagePath,
+      kind: "image",
+      mimeType: "image/png",
+    })]);
+    await expect(resolveWorkspaceContextFiles(workspace, [textPath], {
+      allowExternalImages: true,
+    })).rejects.toThrow("当前工作区内");
+  });
+
   it("rejects directories instead of treating them as prompt resources", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "grok-desktop-context-"));
     temporaryPaths.push(root);

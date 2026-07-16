@@ -361,7 +361,9 @@ export function registerIpcHandlers({
       if (!connectedWorkspacePath || !pathsEqual(connectedWorkspacePath, workspacePath)) {
         throw new Error("只能向当前连接的 Grok 工作区拖入附件。");
       }
-      return resolveWorkspaceContextFiles(workspacePath, filePaths);
+      return resolveWorkspaceContextFiles(workspacePath, filePaths, {
+        allowExternalImages: true,
+      });
     },
   );
 
@@ -628,6 +630,7 @@ export function registerIpcHandlers({
       const references = await resolveWorkspaceContextFiles(
         workspacePath,
         request.contextPaths,
+        { allowExternalImages: true },
       );
       const imageReferences = references.filter((reference) => reference.kind === "image");
       const fileReferences = references.filter((reference) => reference.kind === "file");
